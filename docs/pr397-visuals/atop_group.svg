@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" width="793.7066666666667" height="1122.48" viewBox="0 0 793.7066666666667 1122.48">
+<defs>
+<clipPath id="body-clip-3"><rect x="113.38666666666667" y="132.26666666666668" width="566.9333333333334" height="876.8266666666667"/></clipPath>
+</defs>
+<rect x="0" y="0" width="793.7066666666667" height="1122.48" fill="#ffffff"/>
+<g clip-path="url(#body-clip-3)"><rect x="113.38666666666667" y="132.26666666666668" width="566.9333333333334" height="36.20000000000002" fill="none"/>
+<g transform="translate(113.38666666666667,132.83583333333334) scale(3.5113,1.0284)">
+<text x="2.93" y="14.67" font-size="14.67" fill="#000000" font-style="italic" font-family="'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif">x</text>
+<text x="17.27" y="14.67" font-size="14.67" fill="#000000" text-anchor="middle" font-family="'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif">+</text>
+<text x="23.14" y="14.67" font-size="14.67" fill="#000000" font-style="italic" font-family="'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif">y</text>
+<text x="2.93" y="29.33" font-size="14.67" fill="#000000" font-style="italic" font-family="'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif">u</text>
+<text x="17.27" y="29.33" font-size="14.67" fill="#000000" text-anchor="middle" font-family="'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif">-</text>
+<text x="23.14" y="29.33" font-size="14.67" fill="#000000" font-style="italic" font-family="'Latin Modern Math', 'STIX Two Text', 'STIX Two Math', 'Times New Roman', 'Times', serif">v</text>
+</g>
+</g>
+</svg>
