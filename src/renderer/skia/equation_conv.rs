@@ -411,6 +411,10 @@ fn render_box(
                 canvas, font_mgr, body, x, y, color, fs, new_italic, new_bold,
             );
         }
+        LayoutKind::Color { r, g, b, body } => {
+            let scoped_color = Color::from_argb(255, *r, *g, *b);
+            render_box(canvas, font_mgr, body, x, y, scoped_color, fs, italic, bold);
+        }
         LayoutKind::Space(_) | LayoutKind::Newline | LayoutKind::Empty => {}
     }
 }

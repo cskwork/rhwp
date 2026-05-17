@@ -15,3 +15,15 @@
 - Tests: added imported-equation edit/export/reload coverage and an env-gated real-fixture round-trip test (`RHWP_MATH_FIXTURE_DIR`) for the local math HWP corpus.
 - Verification: existing equation coordinate/duplication regressions also passed (`cargo test --test issue_595`, `cargo test --test issue_301`).
 - Verification: generated WASM package with `docker compose --env-file .env.docker run --rm wasm`, installed Studio deps using a temp npm cache, and `npm run build` in `rhwp-studio` passed. Initial Studio build failed only because `pkg/` and `node_modules/` were absent.
+
+## Problem-bank corpus accuracy audit
+
+- Goal: verify the new math corpus under `/Users/danny/Downloads/문제은행-한글` without copying or committing copyrighted HWP/HWPX files.
+- Finding: the corpus contains 98 `.hwp` files and 1 `.hwpx` file. `export-html` already parses both via format detection, but the CLI help only advertised `.hwp`.
+- Verification artifact: exported 99/99 documents to `/private/tmp/rhwp-problembank-html-20260517`, producing 6,812 HTML pages with 565,282 equation SVG markers and 7,371 tables. No generated corpus content was placed in the repo.
+- Finding: every exported document contained equation markers. The main remaining 1:1 risk is layout overflow/pagination drift; several files emit `LAYOUT_OVERFLOW` diagnostics during render.
+- Fix: `rhwp export-html --help` now prints command help instead of treating `--help` as a filename, and the command documents HWP/HWPX input support.
+- Fix: inline equation `COLOR{R,G,B}{...}` now scopes SVG/canvas/native-Skia equation color to the body instead of silently rendering it with the inherited equation color.
+- Fix: the external equation fixture round-trip test now scans `.hwp` and `.hwpx` files and renders the actual page containing the edited equation, not always page 0; unrelated page render errors are skipped while searching.
+- Fix: the minimal CFB writer now emits DIFAT sectors when a large exported HWP needs more than 109 FAT sectors. This fixes strict CFB reload for large math documents with many embedded BinData streams.
+- Verification: the previous failing large corpus file now converts and reloads with `rhwp info`; after review hardening, the full env-gated corpus equation edit/export/reload gate passed for all 99 documents in 330.00s.

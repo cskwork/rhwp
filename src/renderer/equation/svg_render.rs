@@ -284,6 +284,10 @@ fn render_box(
             };
             render_box(svg, body, x, y, color, fs, new_italic, new_bold);
         }
+        LayoutKind::Color { r, g, b, body } => {
+            let scoped_color = format!("#{:02x}{:02x}{:02x}", r, g, b);
+            render_box(svg, body, x, y, &scoped_color, fs, italic, bold);
+        }
         LayoutKind::Space(_) | LayoutKind::Newline | LayoutKind::Empty => {}
     }
 }
@@ -635,5 +639,21 @@ mod tests {
         let svg = render_eq("평점");
         assert!(!svg.contains("font-style=\"italic\""), "CJK는 italic 미적용: {}", svg);
         assert!(svg.contains("평점"));
+    }
+
+    #[test]
+    fn test_inline_color_scopes_equation_svg_fill() {
+        let svg = render_eq("A COLOR{255,0,0}{B} C");
+
+        assert!(
+            svg.contains("fill=\"#ff0000\"") && svg.contains(">B<"),
+            "COLOR body should render with scoped RGB fill: {}",
+            svg
+        );
+        assert!(
+            svg.contains("fill=\"#000000\"") && svg.contains(">A<") && svg.contains(">C<"),
+            "siblings should keep inherited fill: {}",
+            svg
+        );
     }
 }

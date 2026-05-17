@@ -234,6 +234,10 @@ fn render_box(
             };
             render_box(ctx, body, x, y, color, fs, new_italic, new_bold);
         }
+        LayoutKind::Color { r, g, b, body } => {
+            let scoped_color = format!("#{:02x}{:02x}{:02x}", r, g, b);
+            render_box(ctx, body, x, y, &scoped_color, fs, italic, bold);
+        }
         LayoutKind::Space(_) | LayoutKind::Newline | LayoutKind::Empty => {}
     }
 }

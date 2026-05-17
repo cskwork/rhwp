@@ -83,7 +83,7 @@ fn print_help() {
     println!("      -o, --output <폴더>     출력 폴더 (기본: output/)");
     println!("      -p, --page <번호>       특정 페이지만 내보내기 (0부터 시작)");
     println!();
-    println!("  export-html <파일.hwp> [옵션]");
+    println!("  export-html <파일.hwp|hwpx> [옵션]");
     println!("      페이지별 HTML을 내보내기 (수식은 위치 보존 SVG로 출력)");
     println!();
     println!("      -o, --output <폴더>     출력 폴더 (기본: output/)");
@@ -874,9 +874,16 @@ fn export_text(args: &[String]) {
 }
 
 fn export_html(args: &[String]) {
+    if args.first().map(|s| s.as_str()) == Some("--help")
+        || args.first().map(|s| s.as_str()) == Some("-h")
+    {
+        print_export_html_help();
+        return;
+    }
+
     if args.is_empty() {
-        eprintln!("오류: HWP 파일 경로를 지정해주세요.");
-        eprintln!("사용법: rhwp export-html <파일.hwp> [옵션] (rhwp --help 참조)");
+        eprintln!("오류: HWP/HWPX 파일 경로를 지정해주세요.");
+        eprintln!("사용법: rhwp export-html <파일.hwp|hwpx> [옵션] (rhwp --help 참조)");
         return;
     }
 
@@ -1018,6 +1025,19 @@ fn export_html(args: &[String]) {
         pages.len(),
         output_dir
     );
+}
+
+fn print_export_html_help() {
+    println!("사용법: rhwp export-html <파일.hwp|hwpx> [옵션]");
+    println!();
+    println!("페이지별 HTML을 내보냅니다. 수식은 위치 보존 SVG로 출력합니다.");
+    println!();
+    println!("옵션:");
+    println!("  -o, --output <폴더>     출력 폴더 (기본: output/)");
+    println!("  -p, --page <번호>       특정 페이지만 내보내기 (0부터 시작)");
+    println!("      --show-para-marks   문단부호(↵/↓) 표시");
+    println!("      --show-control-codes");
+    println!("                          조판부호 보이기 (문단부호 + 개체 마커 등)");
 }
 
 fn wrap_exported_html(title: &str, page_num: u32, page_count: u32, body: &str) -> String {
