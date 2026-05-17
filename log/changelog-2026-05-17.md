@@ -34,3 +34,9 @@
 - Fix: align typeset fit checks with layout vpos correction for equation/control flow, keep equation PageItems from resetting layout vpos bases, reserve non-TAC picture/shape visual height around equation flow, and emit HTML structural table wrappers without adding offset parents.
 - Guardrails: kept the vpos policy scoped to equation/control flow because a broader text-only vpos policy regressed `samples/exam_eng.hwp` from 8 to 11 pages.
 - Verification: focused copyrighted input export now generates 157 HTML pages with 0 real `LAYOUT_OVERFLOW`; equation-focused tests, `exam_eng_multicolumn`, and `cargo build` pass. Wider 98-file corpus still has 40 real-overflow docs, so global 1:1 accuracy is not complete yet.
+
+## Draft release note for math/equation HTML positioning
+
+- Added a draft release note instead of creating a GitHub Release because no version/tag was requested.
+- The note explicitly credits the original upstream open source project `edwardkim/rhwp` and states that this fork work is for contribution review.
+- Kept copyrighted HWP/HWPX inputs and generated HTML outputs out of git; only documentation/source changes are committed.
