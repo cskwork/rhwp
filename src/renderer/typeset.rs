@@ -151,6 +151,16 @@ struct TypesetState {
     /// process_multicolumn_break 에서 새 ColumnDef 매칭 시 갱신.
     /// Distribute 다단의 짧은 컬럼 vpos-reset 검출 임계값 완화에 사용.
     current_zone_column_type: ColumnType,
+    /// 다단 수식 흐름의 LINE_SEG vpos 기준점.
+    /// layout의 lazy vpos correction과 같은 기준으로 fit을 판정해야 단 끝 overflow를 막는다.
+    vpos_lazy_base: Option<i32>,
+    /// 직전 문단의 마지막 유효 LINE_SEG (vertical_pos, line_height, line_spacing).
+    vpos_prev_seg: Option<(i32, i32, i32)>,
+    /// 현재 단에서 제어문자(수식/그림/도형/표) 흐름을 만난 뒤에는 후속 텍스트도
+    /// HWP LINE_SEG vpos 간격으로 fit 판정한다.
+    vpos_control_flow_active: bool,
+    /// 문서/구역 흐름에서 수식을 본 뒤에는 수식 주변 그림/표도 같은 vpos 정책을 쓴다.
+    vpos_equation_flow_seen: bool,
 }
 
 impl TypesetState {
@@ -190,6 +200,10 @@ impl TypesetState {
             current_column_wrap_around_paras: Vec::new(),
             current_column_wrap_anchors: std::collections::HashMap::new(),
             current_zone_column_type: column_type,
+            vpos_lazy_base: None,
+            vpos_prev_seg: None,
+            vpos_control_flow_active: false,
+            vpos_equation_flow_seen: false,
         }
     }
 
@@ -267,6 +281,7 @@ impl TypesetState {
             // layout은 body_wide_reserved로 별도 처리하므로 여기서 zone_y_offset에
             // 넣으면 double-shift가 발생.
             self.current_height = self.pending_body_wide_top_reserve;
+            self.reset_vpos_flow();
         } else {
             self.push_new_page();
         }
@@ -301,6 +316,38 @@ impl TypesetState {
         self.current_zone_y_offset = 0.0;
         self.current_zone_layout = None;
         self.on_first_multicolumn_page = false;
+        self.reset_vpos_flow();
+    }
+
+    fn reset_vpos_flow(&mut self) {
+        self.vpos_lazy_base = None;
+        self.vpos_prev_seg = None;
+        self.vpos_control_flow_active = false;
+    }
+
+    fn mark_vpos_after_paragraph(&mut self, para: &Paragraph) {
+        let has_equation = para.controls.iter().any(|c| matches!(c, Control::Equation(_)));
+        if has_equation {
+            self.vpos_equation_flow_seen = true;
+        }
+        if has_equation || (self.vpos_equation_flow_seen && !para.controls.is_empty()) {
+            self.vpos_control_flow_active = true;
+        }
+        self.vpos_prev_seg = para.line_segs
+            .iter()
+            .rev()
+            .find(|seg| seg.segment_width > 0)
+            .or_else(|| para.line_segs.last())
+            .map(|seg| (seg.vertical_pos, seg.line_height, seg.line_spacing));
+
+        if para.controls.iter().any(|c| match c {
+            Control::Picture(pic) => self.vpos_equation_flow_seen || pic.common.treat_as_char,
+            Control::Shape(shape) => self.vpos_equation_flow_seen || shape.common().treat_as_char,
+            Control::Table(table) => self.vpos_equation_flow_seen || table.common.treat_as_char,
+            _ => false,
+        }) {
+            self.vpos_lazy_base = None;
+        }
     }
 
     fn new_page_content(&self, column_contents: Vec<ColumnContent>) -> PageContent {
@@ -938,7 +985,11 @@ impl TypesetEngine {
                                 }
                                 _ => None,
                             };
-                            if let Some(extra) = pushdown_h {
+                            if let Some(extra) = pushdown_h
+                                .filter(|_| !(st.col_count > 1
+                                    && st.vpos_equation_flow_seen
+                                    && self.non_tac_float_flow_height(ctrl).is_some()))
+                            {
                                 st.current_height += extra;
                             }
                         }
@@ -1059,6 +1110,102 @@ impl TypesetEngine {
     // fits + place/split: 배치 판단과 실행
     // ========================================================
 
+    fn paragraph_column_flow_height(
+        &self,
+        st: &TypesetState,
+        para: &Paragraph,
+        fmt: &FormattedParagraph,
+    ) -> f64 {
+        let has_equation = para.controls.iter().any(|c| matches!(c, Control::Equation(_)));
+        let text_height = if st.col_count > 1
+            && (has_equation
+                || st.vpos_control_flow_active
+                || (st.vpos_equation_flow_seen && !para.controls.is_empty()))
+        {
+            fmt.total_height
+        } else if st.col_count > 1 {
+            fmt.height_for_fit
+        } else {
+            fmt.total_height
+        };
+
+        if st.col_count > 1 && st.vpos_equation_flow_seen {
+            para.controls
+                .iter()
+                .filter_map(|ctrl| self.non_tac_float_flow_height(ctrl))
+                .fold(text_height, f64::max)
+        } else {
+            text_height
+        }
+    }
+
+    fn non_tac_float_flow_height(&self, ctrl: &Control) -> Option<f64> {
+        use crate::model::shape::TextWrap;
+
+        let common = match ctrl {
+            Control::Picture(pic) => Some(&pic.common),
+            Control::Shape(shape) => Some(shape.common()),
+            _ => None,
+        }?;
+        if common.treat_as_char
+            || matches!(common.text_wrap, TextWrap::BehindText | TextWrap::InFrontOfText)
+        {
+            return None;
+        }
+
+        let offset = hwpunit_to_px(common.vertical_offset.max(0) as i32, self.dpi);
+        let height = hwpunit_to_px(common.height as i32, self.dpi);
+        let margin_bottom = hwpunit_to_px(common.margin.bottom as i32, self.dpi);
+        Some(offset + height + margin_bottom)
+    }
+
+    fn multicolumn_vpos_bottom(
+        &self,
+        st: &mut TypesetState,
+        para: &Paragraph,
+        fmt: &FormattedParagraph,
+        flow_height: f64,
+    ) -> Option<f64> {
+        let has_equation = para.controls.iter().any(|c| matches!(c, Control::Equation(_)));
+        if st.col_count <= 1
+            || para.line_segs.is_empty()
+            || (!has_equation
+                && !st.vpos_control_flow_active
+                && !(st.vpos_equation_flow_seen && !para.controls.is_empty()))
+        {
+            return None;
+        }
+
+        let (prev_vpos, prev_lh, prev_ls) = st.vpos_prev_seg?;
+        if prev_vpos == 0 {
+            return None;
+        }
+
+        let curr_first_vpos = para.line_segs.first()?.vertical_pos;
+        let prev_vpos_end = prev_vpos + prev_lh + prev_ls;
+        let base = match st.vpos_lazy_base {
+            Some(base) => base,
+            None => {
+                let y_delta_hu = (st.current_height / self.dpi * 7200.0).round() as i32
+                    + prev_ls.max(0);
+                let base = prev_vpos_end - y_delta_hu;
+                if base < 0 {
+                    return None;
+                }
+                st.vpos_lazy_base = Some(base);
+                base
+            }
+        };
+        let vpos_end = if curr_first_vpos > prev_vpos {
+            curr_first_vpos
+        } else {
+            prev_vpos_end
+        };
+        let vpos_top = (hwpunit_to_px(vpos_end - base, self.dpi) - fmt.spacing_before).max(0.0);
+
+        Some(vpos_top + flow_height)
+    }
+
     /// 문단을 현재 페이지에 배치한다.
     /// fits → place(전체) 또는 split(줄 단위) → move(다음 페이지)
     fn typeset_paragraph(
@@ -1094,7 +1241,15 @@ impl TypesetEngine {
         } else {
             LAYOUT_DRIFT_SAFETY_PX
         };
-        let available = (st.available_height() - safety).max(0.0);
+        let mut available = (st.available_height() - safety).max(0.0);
+        let flow_height = self.paragraph_column_flow_height(st, para, fmt);
+        let mut vpos_bottom =
+            self.multicolumn_vpos_bottom(st, para, fmt, flow_height);
+        if vpos_bottom.is_some_and(|bottom| bottom > available) && !st.current_items.is_empty() {
+            st.advance_column_or_new_page();
+            available = (st.available_height() - safety).max(0.0);
+            vpos_bottom = self.multicolumn_vpos_bottom(st, para, fmt, flow_height);
+        }
 
         // Task #321 Stage 1 진단: 포맷터 총 높이 vs LINE_SEG 실측 총 높이 비교
         // Stage 5a 확장: per-paragraph 카테고리 분해 (sb/sa/lines/line_sum/ls_sum)
@@ -1175,6 +1330,7 @@ impl TypesetEngine {
                 st.current_items.push(PageItem::FullParagraph {
                     para_index: para_idx,
                 });
+                st.mark_vpos_after_paragraph(para);
                 return;
             }
         }
@@ -1197,6 +1353,7 @@ impl TypesetEngine {
                     total_h > available && total_h <= available + LAYOUT_DRIFT_SAFETY_PX;
                 if fit_fail_within_safety {
                     st.current_items.push(PageItem::FullParagraph { para_index: para_idx });
+                    st.mark_vpos_after_paragraph(para);
                     return;
                 }
             }
@@ -1209,17 +1366,15 @@ impl TypesetEngine {
         // (k-water-rfp p3 case: 36 items × 평균 ~9px = ~311px LAYOUT_OVERFLOW).
         // trailing_ls 는 페이지 마지막 항목의 fit 판정에만 의미가 있음
         // (페이지 끝에는 다음 줄이 없으니 line_spacing 미적용).
-        if st.current_height + fmt.height_for_fit <= available {
+        let stacked_bottom = st.current_height + flow_height;
+        let fit_bottom = vpos_bottom.unwrap_or(stacked_bottom).max(stacked_bottom);
+        if fit_bottom <= available {
             // place: 전체 배치
             st.current_items.push(PageItem::FullParagraph {
                 para_index: para_idx,
             });
-            // [Task #391] 다단/단단 분기:
-            //   - 단단 (col_count == 1): total_height (k-water-rfp p3 311px drift 차단, #359)
-            //   - 다단 (col_count > 1): height_for_fit (exam_eng 8p 정상 단 채움 복원)
-            // 다단에서는 layout 이 vpos 기반으로 항목을 단별로 stacking 하므로
-            // typeset 누적 시 trailing_ls 인플레이션이 단을 조기 종료시킴.
-            st.current_height += if st.col_count > 1 { fmt.height_for_fit } else { fmt.total_height };
+            st.current_height = fit_bottom;
+            st.mark_vpos_after_paragraph(para);
             return;
         }
 
@@ -1255,7 +1410,8 @@ impl TypesetEngine {
                 st.current_items.push(PageItem::FullParagraph {
                     para_index: para_idx,
                 });
-                st.current_height += if st.col_count > 1 { fmt.height_for_fit } else { fmt.total_height };
+                st.current_height += flow_height;
+                st.mark_vpos_after_paragraph(para);
                 return;
             }
         }
@@ -1266,12 +1422,8 @@ impl TypesetEngine {
             st.current_items.push(PageItem::FullParagraph {
                 para_index: para_idx,
             });
-            // [Task #391] 다단/단단 분기:
-            //   - 단단 (col_count == 1): total_height (k-water-rfp p3 311px drift 차단, #359)
-            //   - 다단 (col_count > 1): height_for_fit (exam_eng 8p 정상 단 채움 복원)
-            // 다단에서는 layout 이 vpos 기반으로 항목을 단별로 stacking 하므로
-            // typeset 누적 시 trailing_ls 인플레이션이 단을 조기 종료시킴.
-            st.current_height += if st.col_count > 1 { fmt.height_for_fit } else { fmt.total_height };
+            st.current_height += flow_height;
+            st.mark_vpos_after_paragraph(para);
             return;
         }
 
@@ -1353,7 +1505,8 @@ impl TypesetEngine {
             let part_sp_after = if end_line >= line_count { fmt.spacing_after } else { 0.0 };
             let part_height = sp_b + part_line_height + part_sp_after;
 
-            if cursor_line == 0 && end_line >= line_count {
+            let placed_full = cursor_line == 0 && end_line >= line_count;
+            if placed_full {
                 // 전체가 배치됨 — overflow 재확인
                 let prev_is_table = st.current_items.last().map_or(false, |item| {
                     matches!(item, PageItem::Table { .. } | PageItem::PartialTable { .. })
@@ -1381,6 +1534,9 @@ impl TypesetEngine {
             st.current_height += part_height;
 
             if end_line >= line_count {
+                if placed_full {
+                    st.mark_vpos_after_paragraph(para);
+                }
                 break;
             }
 
@@ -1625,6 +1781,38 @@ impl TypesetEngine {
                     }
                 }
                 Control::Shape(_) | Control::Picture(_) | Control::Equation(_) => {
+                    let top_bottom_float_h = match ctrl {
+                        Control::Picture(p)
+                            if st.vpos_equation_flow_seen
+                                && !p.common.treat_as_char
+                                && !matches!(
+                                    p.common.text_wrap,
+                                    crate::model::shape::TextWrap::BehindText
+                                        | crate::model::shape::TextWrap::InFrontOfText
+                                ) =>
+                        {
+                            Some(hwpunit_to_px(p.common.height as i32, self.dpi))
+                        }
+                        Control::Shape(s)
+                            if st.vpos_equation_flow_seen
+                                && !s.common().treat_as_char
+                                && !matches!(
+                                    s.common().text_wrap,
+                                    crate::model::shape::TextWrap::BehindText
+                                        | crate::model::shape::TextWrap::InFrontOfText
+                                ) =>
+                        {
+                            Some(hwpunit_to_px(s.common().height as i32, self.dpi))
+                        }
+                        _ => None,
+                    };
+                    if let Some(shape_h) = top_bottom_float_h {
+                        if !st.current_items.is_empty()
+                            && st.current_height + shape_h > st.available_height()
+                        {
+                            st.advance_column_or_new_page();
+                        }
+                    }
                     // Task #402: 같은 paragraph의 선행 TAC 컨트롤이 있는 TAC 그림은
                     // 자기 line_seg에 위치하므로 그 line의 높이를 페이지 누적에 반영해야 함.
                     // 누락 시 후속 항목이 페이지 끝을 넘어 그려져 겹침/오버플로 발생 (#402).
@@ -1662,6 +1850,8 @@ impl TypesetEngine {
                     });
                     if let Some(line_h) = tac_separate_line_h {
                         st.current_height += line_h;
+                    } else if let Some(shape_h) = top_bottom_float_h {
+                        st.current_height += shape_h;
                     }
                 }
                 _ => {}
@@ -1709,6 +1899,15 @@ impl TypesetEngine {
                 st.current_height = height_before + cap;
             }
         }
+
+        if st.vpos_equation_flow_seen
+            || st.vpos_control_flow_active
+            || para.controls.iter().any(|c| {
+                matches!(c, Control::Equation(_) | Control::Picture(_) | Control::Shape(_))
+            })
+        {
+            st.mark_vpos_after_paragraph(para);
+        }
     }
 
     /// TAC(treat_as_char) 표의 조판.
@@ -1739,14 +1938,30 @@ impl TypesetEngine {
             }).unwrap_or(ft.total_height)
         } else if fmt.total_height > 0.0 {
             // 단일 TAC: 호스트 문단의 height_for_fit 사용
-            fmt.height_for_fit
+            if st.col_count > 1 && st.vpos_equation_flow_seen {
+                fmt.height_for_fit.max(ft.total_height)
+            } else {
+                fmt.height_for_fit
+            }
         } else {
             ft.total_height
         };
 
         // TAC 표는 분할하지 않고 통째로 배치
         let available = st.available_height();
-        if st.current_height + table_height > available && !st.current_items.is_empty() {
+        let vpos_flow_height = if st.col_count > 1
+            && st.vpos_equation_flow_seen
+            && ft.total_height > fmt.height_for_fit
+        {
+            table_height + fmt.height_for_fit
+        } else {
+            table_height
+        };
+        let vpos_bottom = self.multicolumn_vpos_bottom(st, para, fmt, vpos_flow_height);
+        if ((st.current_height + table_height > available)
+            || vpos_bottom.is_some_and(|bottom| bottom > available))
+            && !st.current_items.is_empty()
+        {
             st.advance_column_or_new_page();
         }
 
@@ -2639,6 +2854,21 @@ mod tests {
         }
     }
 
+    fn small_page_def() -> PageDef {
+        PageDef {
+            width: 10000,
+            height: 6000,
+            margin_left: 0,
+            margin_right: 0,
+            margin_top: 0,
+            margin_bottom: 0,
+            margin_header: 0,
+            margin_footer: 0,
+            margin_gutter: 0,
+            ..Default::default()
+        }
+    }
+
     /// 두 PaginationResult의 페이지 수와 각 페이지의 항목 수가 동일한지 비교
     fn assert_pagination_match(
         old: &PaginationResult,
@@ -2739,6 +2969,276 @@ mod tests {
         );
 
         assert_pagination_match(&old_result, &new_result, "page_overflow");
+    }
+
+    #[test]
+    fn multicolumn_equation_paragraphs_fit_with_trailing_line_spacing() {
+        use crate::model::control::Control;
+
+        let engine = TypesetEngine::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let paras: Vec<Paragraph> = (0..10)
+            .map(|idx| Paragraph {
+                text: "x".to_string(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: idx * 1700,
+                    line_height: 1000,
+                    line_spacing: 700,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Equation(Box::default())],
+                ..Default::default()
+            })
+            .collect();
+        let composed: Vec<ComposedParagraph> = Vec::new();
+        let col_def = ColumnDef {
+            column_count: 2,
+            same_width: true,
+            ..Default::default()
+        };
+
+        let result = engine.typeset_section(
+            &paras,
+            &composed,
+            &styles,
+            &small_page_def(),
+            &col_def,
+            0,
+            &[],
+            false,
+        );
+
+        assert!(
+            result.pages.len() > 1,
+            "two-column equation flow must count trailing line spacing, otherwise layout overflows"
+        );
+    }
+
+    #[test]
+    fn multicolumn_equation_fit_uses_lineseg_vpos_drift() {
+        use crate::model::control::Control;
+
+        let engine = TypesetEngine::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let page = PageDef {
+            height: 11000,
+            ..small_page_def()
+        };
+        let paras: Vec<Paragraph> = (0..8)
+            .map(|idx| Paragraph {
+                text: "x".to_string(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: idx * 1700,
+                    line_height: 1000,
+                    line_spacing: 0,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Equation(Box::default())],
+                ..Default::default()
+            })
+            .collect();
+        let col_def = ColumnDef {
+            column_count: 2,
+            same_width: true,
+            ..Default::default()
+        };
+
+        let result = engine.typeset_section(
+            &paras,
+            &[],
+            &styles,
+            &page,
+            &col_def,
+            0,
+            &[],
+            false,
+        );
+
+        let first_column_has_last_para = result.pages[0].column_contents[0]
+            .items
+            .iter()
+            .any(|item| matches!(item, PageItem::FullParagraph { para_index: 7 }));
+
+        assert!(
+            !first_column_has_last_para,
+            "multi-column equation fit must use LINE_SEG vpos drift, not only summed line heights"
+        );
+    }
+
+    #[test]
+    fn multicolumn_equation_flow_reserves_non_tac_picture_height() {
+        use crate::model::control::Control;
+        use crate::model::image::Picture;
+        use crate::model::shape::TextWrap;
+
+        let engine = TypesetEngine::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let page = PageDef {
+            height: 8000,
+            ..small_page_def()
+        };
+        let mut picture = Picture::default();
+        picture.common.treat_as_char = false;
+        picture.common.text_wrap = TextWrap::Square;
+        picture.common.height = 2500;
+
+        let paras = vec![
+            Paragraph {
+                text: "eq".to_string(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: 0,
+                    line_height: 1000,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Equation(Box::default())],
+                ..Default::default()
+            },
+            Paragraph {
+                text: "near bottom".to_string(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: 1000,
+                    line_height: 4800,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Paragraph {
+                text: String::new(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: 5800,
+                    line_height: 1000,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Picture(Box::new(picture))],
+                ..Default::default()
+            },
+        ];
+        let col_def = ColumnDef {
+            column_count: 2,
+            same_width: true,
+            ..Default::default()
+        };
+
+        let result = engine.typeset_section(
+            &paras,
+            &[],
+            &styles,
+            &page,
+            &col_def,
+            0,
+            &[],
+            false,
+        );
+
+        let first_column_has_picture_para = result.pages[0].column_contents[0]
+            .items
+            .iter()
+            .any(|item| match item {
+                PageItem::FullParagraph { para_index }
+                | PageItem::Shape { para_index, .. } => *para_index == 2,
+                _ => false,
+            });
+
+        assert!(
+            !first_column_has_picture_para,
+            "non-TAC pictures after equation flow must reserve visual height before column fit"
+        );
+    }
+
+    #[test]
+    fn multicolumn_equation_flow_uses_vpos_for_tac_table_fit() {
+        use crate::model::control::Control;
+        use crate::model::table::Table;
+
+        let engine = TypesetEngine::with_default_dpi();
+        let styles = ResolvedStyleSet::default();
+        let page = PageDef {
+            height: 8000,
+            ..small_page_def()
+        };
+        let mut table = Table::default();
+        table.attr = 0x01;
+        table.common.treat_as_char = true;
+
+        let paras = vec![
+            Paragraph {
+                text: "eq".to_string(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: 0,
+                    line_height: 1000,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Equation(Box::default())],
+                ..Default::default()
+            },
+            Paragraph {
+                text: "near bottom".to_string(),
+                line_segs: vec![LineSeg {
+                    vertical_pos: 1000,
+                    line_height: 5000,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            Paragraph {
+                line_segs: vec![LineSeg {
+                    vertical_pos: 7000,
+                    line_height: 1000,
+                    segment_width: 5000,
+                    ..Default::default()
+                }],
+                controls: vec![Control::Table(Box::new(table))],
+                ..Default::default()
+            },
+        ];
+        let measured_tables = vec![MeasuredTable {
+            para_index: 2,
+            control_index: 0,
+            total_height: 1500.0 / 75.0,
+            row_heights: vec![1500.0 / 75.0],
+            caption_height: 0.0,
+            cell_spacing: 0.0,
+            cumulative_heights: vec![0.0, 1500.0 / 75.0],
+            repeat_header: false,
+            has_header_cells: false,
+            cells: Vec::new(),
+            page_break: Default::default(),
+            row_block_start: Vec::new(),
+            row_block_end: Vec::new(),
+        }];
+        let col_def = ColumnDef {
+            column_count: 2,
+            same_width: true,
+            ..Default::default()
+        };
+
+        let result = engine.typeset_section(
+            &paras,
+            &[],
+            &styles,
+            &page,
+            &col_def,
+            0,
+            &measured_tables,
+            false,
+        );
+
+        let first_column_has_table = result.pages[0].column_contents[0]
+            .items
+            .iter()
+            .any(|item| matches!(item, PageItem::Table { para_index: 2, .. }));
+
+        assert!(
+            !first_column_has_table,
+            "TAC table fit in equation flow must use LINE_SEG vpos bottom, not only current height"
+        );
     }
 
     #[test]

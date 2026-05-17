@@ -27,3 +27,10 @@
 - Fix: the external equation fixture round-trip test now scans `.hwp` and `.hwpx` files and renders the actual page containing the edited equation, not always page 0; unrelated page render errors are skipped while searching.
 - Fix: the minimal CFB writer now emits DIFAT sectors when a large exported HWP needs more than 109 FAT sectors. This fixes strict CFB reload for large math documents with many embedded BinData streams.
 - Verification: the previous failing large corpus file now converts and reloads with `rhwp info`; after review hardening, the full env-gated corpus equation edit/export/reload gate passed for all 99 documents in 330.00s.
+
+## RHWP math/equation HTML positioning fidelity
+
+- Root cause: multi-column math documents encoded equation/control placement in `LINE_SEG.vertical_pos`, while the typeset pass used only accumulated paragraph height for some equation-adjacent controls. That let the layout pass correct visual y positions after pagination had already accepted the item, causing bottom overflow and visible vertical drift in exported HTML.
+- Fix: align typeset fit checks with layout vpos correction for equation/control flow, keep equation PageItems from resetting layout vpos bases, reserve non-TAC picture/shape visual height around equation flow, and emit HTML structural table wrappers without adding offset parents.
+- Guardrails: kept the vpos policy scoped to equation/control flow because a broader text-only vpos policy regressed `samples/exam_eng.hwp` from 8 to 11 pages.
+- Verification: focused copyrighted input export now generates 157 HTML pages with 0 real `LAYOUT_OVERFLOW`; equation-focused tests, `exam_eng_multicolumn`, and `cargo build` pass. Wider 98-file corpus still has 40 real-overflow docs, so global 1:1 accuracy is not complete yet.

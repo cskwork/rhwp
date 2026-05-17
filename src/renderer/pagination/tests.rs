@@ -27,6 +27,21 @@ fn make_paragraph_with_height(line_height: i32) -> Paragraph {
     }
 }
 
+fn small_page_def() -> PageDef {
+    PageDef {
+        width: 10000,
+        height: 6000,
+        margin_left: 0,
+        margin_right: 0,
+        margin_top: 0,
+        margin_bottom: 0,
+        margin_header: 0,
+        margin_footer: 0,
+        margin_gutter: 0,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn test_empty_paragraphs() {
     let paginator = Paginator::with_default_dpi();
@@ -80,6 +95,79 @@ fn test_page_overflow() {
     );
     // 여러 페이지로 분할되어야 함
     assert!(result.pages.len() >= 1);
+}
+
+#[test]
+fn inline_equation_routes_to_split_paragraph_page() {
+    let paginator = Paginator::with_default_dpi();
+    let styles = ResolvedStyleSet::default();
+    let para = Paragraph {
+        text: "abcd".to_string(),
+        line_segs: (0..4)
+            .map(|line| LineSeg {
+                text_start: line,
+                line_height: 3000,
+                ..Default::default()
+            })
+            .collect(),
+        controls: vec![Control::Equation(Box::default())],
+        ..Default::default()
+    };
+    let (result, _) = paginator.paginate(
+        &[para],
+        &[],
+        &styles,
+        &small_page_def(),
+        &ColumnDef::default(),
+        0,
+    );
+
+    let mut shape_pages = Vec::new();
+    for (page_idx, page) in result.pages.iter().enumerate() {
+        for column in &page.column_contents {
+            for item in &column.items {
+                if matches!(item, PageItem::Shape { para_index: 0, control_index: 0 }) {
+                    shape_pages.push(page_idx);
+                }
+            }
+        }
+    }
+
+    assert_eq!(shape_pages, vec![0]);
+}
+
+#[test]
+fn equation_paragraphs_respect_lineseg_vpos_for_column_fit() {
+    let paginator = Paginator::with_default_dpi();
+    let styles = ResolvedStyleSet::default();
+    let paras: Vec<Paragraph> = (0..12)
+        .map(|idx| Paragraph {
+            text: "\u{FFFC}".to_string(),
+            line_segs: vec![LineSeg {
+                vertical_pos: idx * 1000,
+                line_height: 100,
+                line_spacing: 0,
+                segment_width: 10000,
+                ..Default::default()
+            }],
+            controls: vec![Control::Equation(Box::default())],
+            ..Default::default()
+        })
+        .collect();
+
+    let (result, _) = paginator.paginate(
+        &paras,
+        &[],
+        &styles,
+        &small_page_def(),
+        &ColumnDef::default(),
+        0,
+    );
+
+    assert!(
+        result.pages.len() > 1,
+        "equation paragraphs with HWP vpos beyond the body must not be packed into one page"
+    );
 }
 
 #[test]

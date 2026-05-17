@@ -238,23 +238,25 @@ impl Paginator {
             }
 
             // vpos 기반 current_height 보정: layout의 vpos 보정과 동기화
-            // 현재 페이지에 블록 표(비-TAC)가 존재하면 적용 — 블록 표는 layout의
-            // vpos 보정과 pagination의 높이 누적 사이에 누적 drift를 만듦.
+            // 블록 표와 수식 위주 문단은 실측 line height보다 LINE_SEG vpos가 더 정확하다.
+            // pagination이 vpos 간격을 무시하면 한 단에 너무 많이 넣고 layout 단계에서 overflow된다.
             // 핵심: max(current_height, vpos_consumed) — 절대 감소하지 않음
-            // 단, TAC 수식/그림 포함 문단은 제외 — LINE_SEG lh에 수식/그림 높이가
-            // 포함되어 vpos가 과대하므로 보정하면 current_height가 과대 누적됨
+            // 단, TAC 그림/도형 포함 문단은 제외 — LINE_SEG lh에 개체 높이가 포함되어 과대 누적될 수 있음.
             if let Some(prev_pi) = prev_pagination_para {
-                if para_idx != prev_pi && st.page_has_block_table {
-                    let prev_has_tac_eq = paragraphs.get(prev_pi).map(|p| {
+                let prev_has_equation = paragraphs.get(prev_pi)
+                    .map(|p| p.controls.iter().any(|c| matches!(c, Control::Equation(_))))
+                    .unwrap_or(false);
+                let curr_has_equation = para.controls.iter().any(|c| matches!(c, Control::Equation(_)));
+                if para_idx != prev_pi && (st.page_has_block_table || prev_has_equation || curr_has_equation) {
+                    let prev_has_tac_object = paragraphs.get(prev_pi).map(|p| {
                         p.controls.iter().any(|c|
-                            matches!(c, Control::Equation(_)) ||
                             matches!(c, Control::Picture(pic) if pic.common.treat_as_char) ||
                             matches!(c, Control::Shape(s) if s.common().treat_as_char) ||
                             // 글앞으로/글뒤로 Shape: vpos에 Shape 높이가 포함되어 과대 → bypass
                             matches!(c, Control::Shape(s) if matches!(s.common().text_wrap,
                                 crate::model::shape::TextWrap::InFrontOfText | crate::model::shape::TextWrap::BehindText)))
                     }).unwrap_or(false);
-                    if !prev_has_tac_eq {
+                    if !prev_has_tac_object {
                     if let Some(base) = st.page_vpos_base {
                         if let Some(prev_para) = paragraphs.get(prev_pi) {
                             let col_width_hu = st.layout.column_width_hu();
@@ -275,6 +277,11 @@ impl Paginator {
                                         let avail = st.available_height();
                                         if vpos_h <= avail {
                                             st.current_height = vpos_h;
+                                        } else if !st.current_items.is_empty() {
+                                            st.advance_column_or_new_page();
+                                            if let Some(seg) = para.line_segs.first() {
+                                                st.page_vpos_base = Some(seg.vertical_pos);
+                                            }
                                         }
                                     }
                                 }
@@ -1121,10 +1128,26 @@ impl Paginator {
                     }
                 }
                 Control::Equation(_) => {
-                    st.current_items.push(PageItem::Shape {
+                    let item = PageItem::Shape {
                         para_index: para_idx,
                         control_index: ctrl_idx,
-                    });
+                    };
+                    match super::find_inline_control_target_page(
+                        &st.pages, &st.current_items, para_idx, ctrl_idx, para,
+                    ) {
+                        Some((page_idx, col_idx)) => {
+                            if let Some(page) = st.pages.get_mut(page_idx) {
+                                if let Some(col) = page.column_contents.get_mut(col_idx) {
+                                    col.items.push(item);
+                                } else {
+                                    st.current_items.push(item);
+                                }
+                            } else {
+                                st.current_items.push(item);
+                            }
+                        }
+                        None => st.current_items.push(item),
+                    }
                 }
                 Control::Footnote(fn_ctrl) => {
                     if let Some(page) = st.pages.last_mut() {
