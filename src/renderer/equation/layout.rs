@@ -110,6 +110,13 @@ pub enum LayoutKind {
         style: super::symbols::FontStyleKind,
         body: Box<LayoutBox>,
     },
+    /// 색상 범위
+    Color {
+        r: u8,
+        g: u8,
+        b: u8,
+        body: Box<LayoutBox>,
+    },
     /// 공백
     Space(f64),
     /// 줄바꿈 (세로 쌓기용 마커)
@@ -173,7 +180,22 @@ impl EqLayout {
             EqNode::Paren { left, right, body } => self.layout_paren(left, right, body, fs),
             EqNode::Decoration { kind, body } => self.layout_decoration(*kind, body, fs),
             EqNode::FontStyle { style, body } => self.layout_font_style(*style, body, fs),
-            EqNode::Color { body, .. } => self.layout_node(body, fs),
+            EqNode::Color { r, g, b, body } => {
+                let body_box = self.layout_node(body, fs);
+                LayoutBox {
+                    x: body_box.x,
+                    y: body_box.y,
+                    width: body_box.width,
+                    height: body_box.height,
+                    baseline: body_box.baseline,
+                    kind: LayoutKind::Color {
+                        r: *r,
+                        g: *g,
+                        b: *b,
+                        body: Box::new(body_box),
+                    },
+                }
+            }
             EqNode::Space(kind) => self.layout_space(*kind, fs),
             EqNode::Newline => LayoutBox {
                 x: 0.0, y: 0.0, width: 0.0, height: 0.0, baseline: 0.0,

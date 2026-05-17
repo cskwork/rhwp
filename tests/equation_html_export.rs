@@ -239,10 +239,24 @@ fn collect_hwp_files(dir: &Path, files: &mut Vec<PathBuf>) {
         let path = entry.expect("read fixture entry").path();
         if path.is_dir() {
             collect_hwp_files(&path, files);
-        } else if path.extension().and_then(|s| s.to_str()) == Some("hwp") {
+        } else if matches!(
+            path.extension().and_then(|s| s.to_str()),
+            Some("hwp") | Some("hwpx")
+        ) {
             files.push(path);
         }
     }
+}
+
+fn render_page_matching(doc: &HwpDocument, predicate: impl Fn(&str) -> bool) -> Option<String> {
+    for page in 0..doc.page_count() {
+        if let Ok(html) = doc.render_page_html_native(page) {
+            if predicate(&html) {
+                return Some(html);
+            }
+        }
+    }
+    None
 }
 
 #[test]
@@ -257,7 +271,7 @@ fn external_math_fixture_equations_edit_export_reload_when_env_set() {
     files.sort();
     assert!(
         !files.is_empty(),
-        "RHWP_MATH_FIXTURE_DIR should contain recursive .hwp fixtures: {}",
+        "RHWP_MATH_FIXTURE_DIR should contain recursive HWP/HWPX fixtures: {}",
         fixture_dir.display()
     );
 
@@ -278,9 +292,10 @@ fn external_math_fixture_equations_edit_export_reload_when_env_set() {
         )
         .unwrap_or_else(|e| panic!("edit equation in {}: {}", file.display(), e));
 
-        let edited_html = doc
-            .render_page_html_native(0)
-            .unwrap_or_else(|e| panic!("render edited HTML {}: {}", file.display(), e));
+        let edited_html = render_page_matching(&doc, |html| {
+            html.contains(">A<") && html.contains(">B<")
+        })
+        .unwrap_or_else(|| panic!("render edited HTML with edited equation {}", file.display()));
         assert!(
             edited_html.contains("class=\"hwp-equation\"")
                 && edited_html.contains("data-rhwp-control=\"equation\""),
@@ -309,9 +324,10 @@ fn external_math_fixture_equations_edit_export_reload_when_env_set() {
             props_after
         );
 
-        let roundtrip_html = reloaded
-            .render_page_html_native(0)
-            .unwrap_or_else(|e| panic!("render reloaded HTML {}: {}", file.display(), e));
+        let roundtrip_html = render_page_matching(&reloaded, |html| {
+            html.contains(">A<") && html.contains(">B<")
+        })
+        .unwrap_or_else(|| panic!("render reloaded HTML with edited equation {}", file.display()));
         assert!(
             roundtrip_html.contains("class=\"hwp-equation\"")
                 && roundtrip_html.contains("data-rhwp-control=\"equation\""),
