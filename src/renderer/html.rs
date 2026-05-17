@@ -202,6 +202,9 @@ impl HtmlRenderer {
                     ));
                 }
             }
+            RenderNodeType::Equation(eq) => {
+                self.draw_equation(eq, node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height);
+            }
             _ => {}
         }
 
@@ -235,6 +238,76 @@ impl HtmlRenderer {
         if matches!(node.node_type, RenderNodeType::Page(_)) {
             self.end_page();
         }
+    }
+}
+
+impl HtmlRenderer {
+    fn draw_equation(
+        &mut self,
+        equation: &super::render_tree::EquationNode,
+        x: f64,
+        y: f64,
+        w: f64,
+        h: f64,
+    ) {
+        let view_w = if w > 0.0 { w } else { equation.layout_box.width.max(1.0) };
+        let view_h = if h > 0.0 { h } else { equation.layout_box.height.max(1.0) };
+        let scale_x = if equation.layout_box.width > 0.0 && view_w > 0.0 {
+            view_w / equation.layout_box.width
+        } else {
+            1.0
+        };
+        let scale_y = if equation.layout_box.height > 0.0 && view_h > 0.0 {
+            view_h / equation.layout_box.height
+        } else {
+            1.0
+        };
+        let section_attr = equation
+            .section_index
+            .map(|v| format!(" data-section=\"{}\"", v))
+            .unwrap_or_default();
+        let para_attr = equation
+            .para_index
+            .map(|v| format!(" data-para=\"{}\"", v))
+            .unwrap_or_default();
+        let control_attr = equation
+            .control_index
+            .map(|v| format!(" data-control-index=\"{}\"", v))
+            .unwrap_or_default();
+        let cell_attr = equation
+            .cell_index
+            .map(|v| format!(" data-cell=\"{}\"", v))
+            .unwrap_or_default();
+        let cell_para_attr = equation
+            .cell_para_index
+            .map(|v| format!(" data-cell-para=\"{}\"", v))
+            .unwrap_or_default();
+
+        self.output.push_str(&format!(
+            concat!(
+                "<span class=\"hwp-equation\" data-rhwp-control=\"equation\"",
+                "{section_attr}{para_attr}{control_attr}{cell_attr}{cell_para_attr}",
+                " style=\"position:absolute;left:{x}px;top:{y}px;width:{view_w}px;height:{view_h}px;display:inline-block;overflow:visible;\"",
+                " aria-label=\"수식\">",
+                "<svg xmlns=\"http://www.w3.org/2000/svg\" viewBox=\"0 0 {view_w:.2} {view_h:.2}\"",
+                " width=\"{view_w:.2}\" height=\"{view_h:.2}\" style=\"display:block;overflow:visible;\">",
+                "<g transform=\"scale({scale_x:.4},{scale_y:.4})\">",
+                "{svg_content}",
+                "</g></svg></span>\n",
+            ),
+            section_attr = section_attr,
+            para_attr = para_attr,
+            control_attr = control_attr,
+            cell_attr = cell_attr,
+            cell_para_attr = cell_para_attr,
+            x = x,
+            y = y,
+            view_w = view_w,
+            view_h = view_h,
+            scale_x = scale_x,
+            scale_y = scale_y,
+            svg_content = equation.svg_content,
+        ));
     }
 }
 

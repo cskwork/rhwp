@@ -11,6 +11,7 @@ fn main() {
         Some("export-svg") => export_svg(&args[2..]),
         Some("export-png") => export_png(&args[2..]),
         Some("export-pdf") => export_pdf(&args[2..]),
+        Some("export-html") => export_html(&args[2..]),
         Some("export-text") => export_text(&args[2..]),
         Some("export-markdown") => export_markdown(&args[2..]),
         Some("info") => show_info(&args[2..]),
@@ -81,6 +82,14 @@ fn print_help() {
     println!();
     println!("      -o, --output <폴더>     출력 폴더 (기본: output/)");
     println!("      -p, --page <번호>       특정 페이지만 내보내기 (0부터 시작)");
+    println!();
+    println!("  export-html <파일.hwp> [옵션]");
+    println!("      페이지별 HTML을 내보내기 (수식은 위치 보존 SVG로 출력)");
+    println!();
+    println!("      -o, --output <폴더>     출력 폴더 (기본: output/)");
+    println!("      -p, --page <번호>       특정 페이지만 내보내기 (0부터 시작)");
+    println!("      --show-para-marks       문단부호(↵/↓) 표시");
+    println!("      --show-control-codes    조판부호 보이기 (문단부호 + 개체 마커 등)");
     println!();
     println!("  export-markdown <파일.hwp> [옵션]");
     println!("      페이지별 텍스트를 Markdown(.md)으로 내보내기");
@@ -862,6 +871,187 @@ fn export_text(args: &[String]) {
     }
 
     println!("텍스트 내보내기 완료: {}개 TXT 파일 → {}/", pages.len(), output_dir);
+}
+
+fn export_html(args: &[String]) {
+    if args.is_empty() {
+        eprintln!("오류: HWP 파일 경로를 지정해주세요.");
+        eprintln!("사용법: rhwp export-html <파일.hwp> [옵션] (rhwp --help 참조)");
+        return;
+    }
+
+    let file_path = &args[0];
+    let mut output_dir = "output".to_string();
+    let mut target_page: Option<u32> = None;
+    let mut show_para_marks = false;
+    let mut show_control_codes = false;
+
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--output" | "-o" => {
+                if i + 1 < args.len() {
+                    output_dir = args[i + 1].clone();
+                    i += 2;
+                } else {
+                    eprintln!("오류: --output 뒤에 폴더 경로가 필요합니다.");
+                    return;
+                }
+            }
+            "--page" | "-p" => {
+                if i + 1 < args.len() {
+                    match args[i + 1].parse::<u32>() {
+                        Ok(n) => target_page = Some(n),
+                        Err(_) => {
+                            eprintln!("오류: 페이지 번호가 올바르지 않습니다.");
+                            return;
+                        }
+                    }
+                    i += 2;
+                } else {
+                    eprintln!("오류: --page 뒤에 페이지 번호가 필요합니다.");
+                    return;
+                }
+            }
+            "--show-para-marks" => {
+                show_para_marks = true;
+                i += 1;
+            }
+            "--show-control-codes" => {
+                show_control_codes = true;
+                i += 1;
+            }
+            _ => {
+                eprintln!("알 수 없는 옵션: {}", args[i]);
+                i += 1;
+            }
+        }
+    }
+
+    let data = match fs::read(file_path) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("오류: 파일을 읽을 수 없습니다 - {}: {}", file_path, e);
+            return;
+        }
+    };
+
+    let mut doc = match rhwp::wasm_api::HwpDocument::from_bytes(&data) {
+        Ok(d) => d,
+        Err(e) => {
+            eprintln!("오류: HWP 파싱 실패 - {}", e);
+            return;
+        }
+    };
+
+    if let Some(parent) = std::path::Path::new(file_path).parent() {
+        let _loaded = doc.populate_external_images_from_dir(parent);
+    }
+    if show_para_marks {
+        doc.set_show_paragraph_marks(true);
+    }
+    if show_control_codes {
+        doc.set_show_control_codes(true);
+    }
+
+    let page_count = doc.page_count();
+    println!("문서 로드 완료: {} ({}페이지)", file_path, page_count);
+    if page_count == 0 {
+        eprintln!("오류: 문서에 페이지가 없습니다.");
+        return;
+    }
+
+    let output_path = Path::new(&output_dir);
+    if !output_path.exists() {
+        if let Err(e) = fs::create_dir_all(output_path) {
+            eprintln!(
+                "오류: 출력 폴더를 생성할 수 없습니다 - {}: {}",
+                output_dir, e
+            );
+            return;
+        }
+    }
+
+    let pages: Vec<u32> = match target_page {
+        Some(p) => {
+            if p >= page_count {
+                eprintln!(
+                    "오류: 페이지 번호가 범위를 벗어났습니다 (0~{})",
+                    page_count - 1
+                );
+                return;
+            }
+            vec![p]
+        }
+        None => (0..page_count).collect(),
+    };
+
+    let file_stem = Path::new(file_path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("page");
+
+    for page_num in &pages {
+        match doc.render_page_html_native(*page_num) {
+            Ok(body) => {
+                let html = wrap_exported_html(file_stem, *page_num, page_count, &body);
+                let html_filename = if page_count == 1 {
+                    format!("{}.html", file_stem)
+                } else {
+                    format!("{}_{:03}.html", file_stem, page_num + 1)
+                };
+                let html_path = output_path.join(&html_filename);
+
+                match fs::write(&html_path, html.as_bytes()) {
+                    Ok(_) => println!("  → {}", html_path.display()),
+                    Err(e) => eprintln!("오류: HTML 저장 실패 - {}: {}", html_path.display(), e),
+                }
+            }
+            Err(e) => {
+                eprintln!("오류: 페이지 {} HTML 렌더링 실패 - {:?}", page_num, e);
+            }
+        }
+    }
+
+    println!(
+        "HTML 내보내기 완료: {}개 HTML 파일 → {}/",
+        pages.len(),
+        output_dir
+    );
+}
+
+fn wrap_exported_html(title: &str, page_num: u32, page_count: u32, body: &str) -> String {
+    format!(
+        concat!(
+            "<!doctype html>\n<html lang=\"ko\">\n<head>\n",
+            "<meta charset=\"utf-8\">\n",
+            "<meta name=\"generator\" content=\"rhwp\">\n",
+            "<meta name=\"rhwp-page\" content=\"{}\">\n",
+            "<meta name=\"rhwp-page-count\" content=\"{}\">\n",
+            "<title>{}</title>\n",
+            "<style>body{{margin:0;background:#f5f5f5;}}.hwp-page{{margin:24px auto;background:white;box-shadow:0 2px 10px rgba(0,0,0,.12);}}.hwp-equation svg text{{user-select:text;}}</style>\n",
+            "</head>\n<body>\n{}\n</body>\n</html>\n",
+        ),
+        page_num + 1,
+        page_count,
+        escape_html_attr(title),
+        body,
+    )
+}
+
+fn escape_html_attr(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
 }
 
 fn export_markdown(args: &[String]) {

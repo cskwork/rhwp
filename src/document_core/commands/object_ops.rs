@@ -3351,6 +3351,8 @@ impl DocumentCore {
         let new_h = crate::renderer::px_to_hwpunit(layout_box.height, dpi).max(0) as u32;
         eq.common.width = new_w;
         eq.common.height = new_h;
+        // Imported raw CTRL_HEADER contains old geometry; regenerate it after edits.
+        eq.raw_ctrl_data.clear();
 
         // 표 셀 내 수식인 경우 표 dirty 플래그 설정
         if cell_idx.is_some() {
