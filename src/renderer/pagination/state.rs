@@ -123,6 +123,8 @@ impl PaginationState {
         if self.current_column + 1 < self.col_count {
             self.current_column += 1;
             self.current_height = 0.0;
+            self.page_vpos_base = None;
+            self.page_has_block_table = false;
         } else {
             self.push_new_page();
         }

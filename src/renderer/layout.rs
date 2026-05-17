@@ -1629,6 +1629,15 @@ impl LayoutEngine {
             // lazy_base로 교정되어 앵커 y가 상승 → body_bottom clamp → LAYOUT_OVERFLOW.
             let is_table_or_shape = matches!(item,
                 PageItem::Table { .. } | PageItem::PartialTable { .. } | PageItem::Shape { .. });
+            let is_equation_shape = if let PageItem::Shape { para_index, control_index } = item {
+                paragraphs
+                    .get(*para_index)
+                    .and_then(|p| p.controls.get(*control_index))
+                    .map(|c| matches!(c, Control::Equation(_)))
+                    .unwrap_or(false)
+            } else {
+                false
+            };
             let is_para_float_table = if let PageItem::Table { para_index, control_index } = item {
                 paragraphs
                     .get(*para_index)
@@ -1646,7 +1655,7 @@ impl LayoutEngine {
             } else {
                 false
             };
-            if was_tac || (is_table_or_shape && !is_para_float_table) {
+            if was_tac || (is_table_or_shape && !is_equation_shape && !is_para_float_table) {
                 vpos_page_base = None;
                 vpos_lazy_base = None;
             }

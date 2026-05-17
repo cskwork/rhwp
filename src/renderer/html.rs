@@ -68,7 +68,7 @@ impl HtmlRenderer {
             }
             RenderNodeType::Header => {
                 self.output.push_str(&format!(
-                    "<header class=\"page-header\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;\">\n",
+                    "<header class=\"page-header\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;\">\n",
                     node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                 ));
                 for child in &node.children {
@@ -79,7 +79,7 @@ impl HtmlRenderer {
             }
             RenderNodeType::Footer => {
                 self.output.push_str(&format!(
-                    "<footer class=\"page-footer\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;\">\n",
+                    "<footer class=\"page-footer\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;\">\n",
                     node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                 ));
                 for child in &node.children {
@@ -90,7 +90,7 @@ impl HtmlRenderer {
             }
             RenderNodeType::Body { .. } => {
                 self.output.push_str(&format!(
-                    "<div class=\"page-body\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;\">\n",
+                    "<div class=\"page-body\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;\">\n",
                     node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                 ));
                 for child in &node.children {
@@ -101,7 +101,7 @@ impl HtmlRenderer {
             }
             RenderNodeType::Column(col_idx) => {
                 self.output.push_str(&format!(
-                    "<div class=\"column column-{}\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;\">\n",
+                    "<div class=\"column column-{}\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;\">\n",
                     col_idx, node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                 ));
                 for child in &node.children {
@@ -112,7 +112,7 @@ impl HtmlRenderer {
             }
             RenderNodeType::TextLine(line) => {
                 self.output.push_str(&format!(
-                    "<div class=\"text-line\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;line-height:{}px;\">\n",
+                    "<div class=\"text-line\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;line-height:{}px;\">\n",
                     node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height, line.line_height,
                 ));
                 for child in &node.children {
@@ -164,7 +164,11 @@ impl HtmlRenderer {
             }
             RenderNodeType::Table(_table) => {
                 self.output.push_str(&format!(
-                    "<table class=\"hwp-table\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;border-collapse:collapse;\">\n",
+                    "<div class=\"hwp-table-frame\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;pointer-events:none;\"></div>\n",
+                    node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
+                ));
+                self.output.push_str(&format!(
+                    "<table class=\"hwp-table\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;border-collapse:collapse;\">\n",
                     node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                 ));
                 for child in &node.children {
@@ -175,8 +179,12 @@ impl HtmlRenderer {
             }
             RenderNodeType::TableCell(cell) => {
                 self.output.push_str(&format!(
-                    "<td colspan=\"{}\" rowspan=\"{}\" style=\"width:{}px;height:{}px;\">\n",
-                    cell.col_span, cell.row_span, node.bbox.width, node.bbox.height,
+                    "<div class=\"hwp-table-cell-frame\" style=\"position:absolute;left:{}px;top:{}px;width:{}px;height:{}px;pointer-events:none;\"></div>\n",
+                    node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
+                ));
+                self.output.push_str(&format!(
+                    "<td colspan=\"{}\" rowspan=\"{}\" data-left=\"{}\" data-top=\"{}\" data-width=\"{}\" data-height=\"{}\" style=\"display:contents;\">\n",
+                    cell.col_span, cell.row_span, node.bbox.x, node.bbox.y, node.bbox.width, node.bbox.height,
                 ));
                 for child in &node.children {
                     self.render_node(child);
@@ -609,6 +617,62 @@ mod tests {
         renderer.render_tree(&tree);
         let output = renderer.output();
         assert!(output.contains("hwp-page"));
+    }
+
+    #[test]
+    fn structural_wrappers_do_not_offset_absolute_children() {
+        use super::super::render_tree::*;
+
+        let mut tree = PageRenderTree::new(0, 800.0, 600.0);
+        let mut body = RenderNode::new(
+            1,
+            RenderNodeType::Body { clip_rect: None },
+            BoundingBox::new(10.0, 20.0, 700.0, 500.0),
+        );
+        let mut column = RenderNode::new(
+            2,
+            RenderNodeType::Column(0),
+            BoundingBox::new(30.0, 40.0, 600.0, 400.0),
+        );
+        let mut line = RenderNode::new(
+            3,
+            RenderNodeType::TextLine(TextLineNode::new(20.0, 15.0)),
+            BoundingBox::new(50.0, 60.0, 500.0, 20.0),
+        );
+        line.children.push(RenderNode::new(
+            4,
+            RenderNodeType::TextRun(TextRunNode {
+                text: "x".to_string(),
+                style: TextStyle::default(),
+                char_shape_id: None,
+                para_shape_id: None,
+                section_index: None,
+                para_index: None,
+                char_start: None,
+                cell_context: None,
+                is_para_end: false,
+                is_line_break_end: false,
+                rotation: 0.0,
+                is_vertical: false,
+                char_overlap: None,
+                border_fill_id: 0,
+                baseline: 15.0,
+                field_marker: Default::default(),
+            }),
+            BoundingBox::new(70.0, 80.0, 10.0, 20.0),
+        ));
+        column.children.push(line);
+        body.children.push(column);
+        tree.root.children.push(body);
+
+        let mut renderer = HtmlRenderer::new();
+        renderer.render_tree(&tree);
+        let output = renderer.output();
+
+        assert!(output.contains("left:70px;top:80px"));
+        assert!(!output.contains("class=\"page-body\" style=\"position:absolute"));
+        assert!(!output.contains("class=\"column column-0\" style=\"position:absolute"));
+        assert!(!output.contains("class=\"text-line\" style=\"position:absolute"));
     }
 
     #[test]

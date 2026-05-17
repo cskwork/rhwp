@@ -25,6 +25,36 @@ fn a4_page_def() -> PageDef {
     }
 }
 
+fn small_page_def() -> PageDef {
+    PageDef {
+        width: 10000,
+        height: 6000,
+        margin_left: 0,
+        margin_right: 0,
+        margin_top: 0,
+        margin_bottom: 0,
+        margin_header: 0,
+        margin_footer: 0,
+        margin_gutter: 0,
+        ..Default::default()
+    }
+}
+
+fn page_def_with_body_height(height: u32) -> PageDef {
+    PageDef {
+        width: 10000,
+        height,
+        margin_left: 0,
+        margin_right: 0,
+        margin_top: 0,
+        margin_bottom: 0,
+        margin_header: 0,
+        margin_footer: 0,
+        margin_gutter: 0,
+        ..Default::default()
+    }
+}
+
 #[test]
 fn test_build_empty_page() {
     let engine = LayoutEngine::with_default_dpi();
@@ -101,6 +131,66 @@ fn test_build_page_with_paragraph() {
     let body = body.unwrap();
     // Column 노드가 있어야 함
     assert!(!body.children.is_empty());
+}
+
+#[test]
+fn equation_shapes_do_not_reset_column_vpos_base() {
+    use crate::model::control::Control;
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(
+        &page_def_with_body_height(7000),
+        &ColumnDef::default(),
+    );
+    let paragraphs: Vec<Paragraph> = (0..4)
+        .map(|idx| Paragraph {
+            text: "x".to_string(),
+            line_segs: vec![LineSeg {
+                vertical_pos: 100000 + idx * 1700,
+                line_height: 1000,
+                line_spacing: 700,
+                baseline_distance: 800,
+                segment_width: 10000,
+                ..Default::default()
+            }],
+            controls: vec![Control::Equation(Box::default())],
+            ..Default::default()
+        })
+        .collect();
+    let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
+    let styles = ResolvedStyleSet::default();
+    let mut items = Vec::new();
+    for idx in 0..paragraphs.len() {
+        items.push(PageItem::FullParagraph { para_index: idx });
+        items.push(PageItem::Shape { para_index: idx, control_index: 0 });
+    }
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 0,
+        section_index: 0,
+        layout,
+        column_contents: vec![ColumnContent {
+            column_index: 0,
+            items,
+            zone_layout: None,
+            zone_y_offset: 0.0,
+            wrap_around_paras: Vec::new(),
+            used_height: 0.0,
+            wrap_anchors: std::collections::HashMap::new(),
+        }],
+        active_header: None,
+        active_footer: None,
+        page_number_pos: None, page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None, extra_master_pages: Vec::new(),
+    };
+
+    let _tree = engine.build_render_tree(&page_content, &paragraphs, &paragraphs, &paragraphs, &composed, &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+
+    assert!(
+        engine.take_overflows().is_empty(),
+        "equation PageItem::Shape must not invalidate vpos base and double-add line spacing"
+    );
 }
 
 #[test]
