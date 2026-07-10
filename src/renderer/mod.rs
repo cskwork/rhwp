@@ -8,27 +8,33 @@ use serde::Serialize;
 use crate::model::style::{LineSpacingType, UnderlineType};
 
 pub mod canvas;
+pub mod canvaskit_policy;
 pub mod composer;
 pub mod equation;
+pub(crate) mod equation_tac_flow;
+pub mod float_placement;
 pub mod font_metrics_data;
+pub(crate) mod form_caption;
+pub mod height_cursor;
 pub mod height_measurer;
 pub mod html;
+pub mod image_resolver;
 pub mod layer_renderer;
 pub mod layout;
 pub mod page_layout;
 pub mod page_number;
 pub mod pagination;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod pdf;
 pub mod pua_oldhangul;
 pub mod render_tree;
 pub mod scheduler;
+#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
+pub mod skia;
 pub mod style_resolver;
 pub mod svg;
 pub mod svg_fragment;
 pub mod svg_layer;
-#[cfg(not(target_arch = "wasm32"))]
-pub mod pdf;
-#[cfg(all(not(target_arch = "wasm32"), feature = "native-skia"))]
-pub mod skia;
 pub mod typeset;
 #[cfg(target_arch = "wasm32")]
 pub mod web_canvas;
@@ -80,6 +86,28 @@ pub struct TabLeaderInfo {
     pub fill_type: u8,
 }
 
+pub(crate) fn clamp_tab_leader_end_x(
+    text: &str,
+    char_positions: &[f64],
+    leader: &TabLeaderInfo,
+    font_size: f64,
+) -> f64 {
+    let content_stop = text.chars().enumerate().find_map(|(i, ch)| {
+        if ch != '\t'
+            && !ch.is_whitespace()
+            && i < char_positions.len()
+            && char_positions[i] > leader.start_x + 0.5
+        {
+            Some(char_positions[i] - font_size * 0.25)
+        } else {
+            None
+        }
+    });
+    content_stop
+        .map(|stop| stop.min(leader.end_x).max(leader.start_x))
+        .unwrap_or(leader.end_x)
+}
+
 /// 텍스트 렌더링 스타일
 #[derive(Debug, Clone, Serialize)]
 pub struct TextStyle {
@@ -111,6 +139,19 @@ pub struct TextStyle {
     pub available_width: f64,
     /// 단 시작으로부터 run 시작 위치 (탭 절대좌표 변환용)
     pub line_x_offset: f64,
+    /// 단 시작으로부터 텍스트 영역 시작 위치 (effective_margin_left, px).
+    /// auto_tab_right 의 col-relative 위치 = text_start_offset + available_width.
+    /// [Task #874] 종전 find_next_tab_stop 의 auto_right 반환값(=available_width) 은
+    /// 텍스트-시작-상대 좌표였으나, 호출자(compute_char_positions / pending_right_tab)
+    /// 가 col-relative 로 해석해 effective_margin_left 만큼 좌측으로 밀린 정렬 발생.
+    /// 본 필드로 변환 보정.
+    pub text_start_offset: f64,
+    /// auto_tab_right + 다음 run-경계 cross 시 우측 정렬 블록의 총 폭 (px).
+    /// composer 가 lang/script 경계로 run 을 쪼개면 (예: "F3→Alt+I" → "F3"/"→"/"Alt+I")
+    /// `measure_segment_from` 이 현재 run 의 post-tab chars 만 측정하여 seg_w 가
+    /// 과소되고, 우측 정렬이 무너진다. paragraph_layout 에서 line 내 후속 runs 합산
+    /// 을 미리 계산해 주입한다. None 이면 기존 동작 (현재 run 내부 측정).
+    pub right_tab_block_width_override: Option<f64>,
     /// 탭 리더 정보 (compute_char_positions 후 채움)
     pub tab_leaders: Vec<TabLeaderInfo>,
     /// HWPX 인라인 탭 확장 데이터 ([width, leader, type, ...])
@@ -163,7 +204,27 @@ impl TextStyle {
     /// 시각 bold 소실을 보완하기 위해 SVG 출력 시 font-weight="bold" 강제에
     /// 사용된다.
     pub fn is_visually_bold(&self) -> bool {
-        self.bold || crate::renderer::style_resolver::is_heavy_display_face(&self.font_family)
+        self.bold
+            || crate::renderer::style_resolver::is_heavy_display_face(&self.font_family)
+            || crate::renderer::style_resolver::is_bold_weight_face(&self.font_family)
+    }
+
+    /// 중고딕 계열(font-weight 500) 여부. SVG/HTML 출력 시 `font-weight: 500` 힌트 삽입에 사용.
+    pub fn is_medium_weight(&self) -> bool {
+        !self.bold && crate::renderer::style_resolver::is_medium_weight_face(&self.font_family)
+    }
+
+    /// CSS/SVG font-weight hint for fallback rendering.
+    pub fn css_font_weight(&self) -> Option<&'static str> {
+        if self.is_visually_bold() {
+            Some("bold")
+        } else if crate::renderer::style_resolver::is_light_weight_face(&self.font_family) {
+            Some("300")
+        } else if self.is_medium_weight() {
+            Some("500")
+        } else {
+            None
+        }
     }
 }
 
@@ -184,6 +245,8 @@ impl Default for TextStyle {
             auto_tab_right: false,
             available_width: 0.0,
             line_x_offset: 0.0,
+            text_start_offset: 0.0,
+            right_tab_block_width_override: None,
             tab_leaders: Vec::new(),
             inline_tabs: Vec::new(),
             extra_word_spacing: 0.0,
@@ -373,11 +436,15 @@ pub enum PathCommand {
 /// (x1, y1): 시작점, (x2, y2): 끝점, rx/ry: 반지름,
 /// phi: x축 회전(도), large_arc/sweep: 플래그
 pub fn svg_arc_to_beziers(
-    x1: f64, y1: f64,
-    mut rx: f64, mut ry: f64,
+    x1: f64,
+    y1: f64,
+    mut rx: f64,
+    mut ry: f64,
     phi_deg: f64,
-    large_arc: bool, sweep: bool,
-    x2: f64, y2: f64,
+    large_arc: bool,
+    sweep: bool,
+    x2: f64,
+    y2: f64,
 ) -> Vec<PathCommand> {
     use std::f64::consts::PI;
 
@@ -523,13 +590,98 @@ pub fn corrected_line_height(
 ) -> f64 {
     if max_fs > 0.0 && raw_lh < max_fs {
         match ls_type {
-            LineSpacingType::Percent   => max_fs * ls_val / 100.0,
-            LineSpacingType::Fixed     => ls_val.max(max_fs),
+            LineSpacingType::Percent => max_fs * ls_val / 100.0,
+            LineSpacingType::Fixed => ls_val.max(max_fs),
             LineSpacingType::SpaceOnly => max_fs + ls_val,
-            LineSpacingType::Minimum   => ls_val.max(max_fs),
+            LineSpacingType::Minimum => ls_val.max(max_fs),
         }
     } else {
         raw_lh
+    }
+}
+
+/// LINE_SEG의 line_height/line_spacing 의미를 보존하면서 폴백 line_height를 보정한다.
+///
+/// raw line_height가 글자 크기보다 작은 합성 줄은 한컴의
+/// `(line_height=base, line_spacing=extra)` 모델에 맞춰 분해한다.
+#[inline]
+pub fn corrected_line_metrics(
+    raw_lh: f64,
+    raw_ls: f64,
+    max_fs: f64,
+    ls_type: LineSpacingType,
+    ls_val: f64,
+) -> (f64, f64) {
+    if max_fs > 0.0 && raw_lh < max_fs {
+        match ls_type {
+            LineSpacingType::Percent => {
+                let extra = (max_fs * (ls_val - 100.0) / 100.0).max(0.0);
+                (max_fs, extra)
+            }
+            LineSpacingType::Fixed => (ls_val.max(max_fs), 0.0),
+            LineSpacingType::SpaceOnly => (max_fs, ls_val.max(0.0)),
+            LineSpacingType::Minimum => (ls_val.max(max_fs), 0.0),
+        }
+    } else {
+        (raw_lh, raw_ls)
+    }
+}
+
+/// 저장된 순수 텍스트 줄은 `vertsize`에 내부 여백이 포함되어도 한컴의 줄 진행이
+/// `textheight + spacing`에 맞춰지는 사례가 있다. IR 값은 보존하고 렌더/조판용
+/// line height만 낮춘다.
+#[inline]
+pub fn corrected_line_metrics_for_source(
+    raw_lh: f64,
+    raw_text_height: f64,
+    raw_ls: f64,
+    max_fs: f64,
+    ls_type: LineSpacingType,
+    ls_val: f64,
+    use_stored_text_height: bool,
+) -> (f64, f64) {
+    let (lh, ls) = corrected_line_metrics(raw_lh, raw_ls, max_fs, ls_type, ls_val);
+    if use_stored_text_height
+        && raw_text_height > 0.0
+        && raw_text_height < lh
+        && (max_fs <= 0.0 || raw_text_height + 0.5 >= max_fs * 0.8)
+    {
+        (raw_text_height, ls)
+    } else {
+        (lh, ls)
+    }
+}
+
+/// HWP3-origin HWP5 conversions may omit PARA_LINE_SEG for body paragraphs.
+/// The composer then emits synthetic lines with a tiny raw line height. For
+/// those synthetic lines, applying ParaShape's percent line spacing again makes
+/// the paragraph too tall compared with Hancom's converted layout.
+#[inline]
+pub fn corrected_line_height_for_variant_synthetic(
+    raw_lh: f64,
+    max_fs: f64,
+    ls_type: LineSpacingType,
+    ls_val: f64,
+    hwp3_variant_synthetic: bool,
+) -> f64 {
+    if hwp3_variant_synthetic && max_fs > 0.0 && raw_lh < max_fs {
+        max_fs
+    } else {
+        corrected_line_height(raw_lh, max_fs, ls_type, ls_val)
+    }
+}
+
+/// [Task #1116] HWP3-origin HWP5 변환본의 문단 앞 간격 보정.
+///
+/// 기존 style resolver는 변환본의 ParaShape spacing 계열을 절반으로 줄인다.
+/// 이는 페이지 수 회귀를 막기 위해 유지하되, 본문 흐름에서 다음 문단을
+/// 배치할 때 쓰는 `spacing_before`는 한컴 PDF의 3mm 격자와 같이 원래 값을 쓴다.
+#[inline]
+pub(crate) fn hwp3_variant_flow_spacing_before(base: f64, is_hwp3_variant: bool) -> f64 {
+    if is_hwp3_variant {
+        base * 2.0
+    } else {
+        base
     }
 }
 
@@ -545,45 +697,129 @@ pub fn px_to_hwpunit(px: f64, dpi: f64) -> i32 {
     (px * HWPUNIT_PER_INCH / dpi) as i32
 }
 
+/// [Task #1745] 텍스트 혼합 anchor 문단의 Square wrap 표 우측 wrap 띠 (cs, sw) HU 도출.
+///
+/// Square wrap(어울림) 표가 텍스트 문단(예: 별표 제목)에 anchor 되면 anchor 문단의
+/// 첫 LINE_SEG 는 전폭 텍스트 줄(cs=0)이라 wrap 띠를 인코딩하지 않는다. 이때 표
+/// geometry(가로 오프셋 + 바깥여백 좌 + 폭 + 바깥여백 우)로 띠 시작 cs 를 계산하고,
+/// 띠 폭은 전폭 줄 너비에서 뺀 나머지로 잡는다 (한글 저장 LINE_SEG 와 정확 일치 —
+/// samples/task1745 cs=45568=45002+283×2, sw=2620=48188−45568).
+///
+/// 기존 케이스(표 단독 anchor — 첫 LINE_SEG 가 이미 띠, cs>0)나 텍스트 없는 anchor,
+/// 좌측 정렬이 아닌 표, 띠 폭이 남지 않는 표는 None (기존 경로 유지).
+pub(crate) fn text_anchor_square_table_strip(
+    para: &crate::model::paragraph::Paragraph,
+) -> Option<(i32, i32)> {
+    let first = para.line_segs.first()?;
+    if first.column_start != 0 {
+        return None;
+    }
+    let full_sw = first.segment_width;
+    if full_sw <= 0 {
+        return None;
+    }
+    let has_real_text = para.text.chars().any(|c| c > '\u{001F}' && c != '\u{FFFC}');
+    if !has_real_text {
+        return None;
+    }
+    let cm = para.controls.iter().find_map(|c| match c {
+        crate::model::control::Control::Table(t)
+            if !t.common.treat_as_char
+                && matches!(t.common.text_wrap, crate::model::shape::TextWrap::Square)
+                && matches!(t.common.horz_align, crate::model::shape::HorzAlign::Left) =>
+        {
+            Some(&t.common)
+        }
+        _ => None,
+    })?;
+    let strip_cs = cm.horizontal_offset as i32
+        + cm.margin.left as i32
+        + cm.width as i32
+        + cm.margin.right as i32;
+    let strip_sw = full_sw - strip_cs;
+    (strip_cs > 0 && strip_sw > 0).then_some((strip_cs, strip_sw))
+}
+
 /// CSS generic fallback 반환 (serif 또는 sans-serif)
 ///
 /// 폰트 이름에 명조/바탕/궁서 등 세리프 계열 키워드가 포함되면 "serif",
 /// 그 외에는 "sans-serif"를 반환한다.
 pub fn generic_fallback(font_family: &str) -> &'static str {
+    // Task #727 (F-1): sans/serif chain 마지막 단계에 함초롬바탕 family
+    // (확장B → 확장 → 일반) 를 끼움. 한컴 자체 PUA 영역 (사각 안 숫자
+    // U+F02B1~F02C5 등) 글리프는 표준 한글 폰트 (Malgun Gothic, Noto Sans
+    // KR 등) 에 없어 .notdef tofu 가 나옴. 함초롬바탕 확장B 가 한컴 PUA
+    // 글리프를 보유하므로 chain 의 generic 직전에 우선순위로 매칭시킨다.
+    // 한글 본문 영역은 1순위 폰트가 글리프 가지면 chain 우선순위에 의해
+    // 1순위 사용 → 영향 0. PUA 글리프 부재 시에만 함초롬바탕 매칭.
     if font_family.is_empty() {
-        // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → generic
-        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif";
+        // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → 한컴 → generic
+        // Task #1224: 시스템 고딕(맑은고딕/Apple) 부재 환경(Linux/CI)에서 폴백되는
+        // 'Noto Sans KR'(CJK Regular)의 획이 한컴 돋움보다 +43% 두꺼워 본문이 과도하게
+        // 굵게 렌더됨. 한컴 돋움 획 두께(페이지 밀도 0.265)에 근접한
+        // 'Noto Sans KR ExtraLight'(rsvg 페이지 밀도 0.277)를 무거운 Noto 직전에 삽입 —
+        // 시스템 고딕 렌더는 무영향, Noto 폴백만 가볍게 교체.
+        return "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR ExtraLight','Noto Sans KR','Pretendard','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',sans-serif";
     }
     // 고정폭 키워드
     let lower = font_family.to_ascii_lowercase();
-    if font_family.contains("굴림체") || font_family.contains("바탕체")
-        || lower.contains("gulimche") || lower.contains("batangche")
-        || lower.contains("coding") || lower.contains("courier")
+    if (font_family.contains("KoPub돋움체") || lower.contains("kopub dotum"))
+        && (font_family.contains("Light") || lower.contains("light"))
+    {
+        return "'Noto Sans KR ExtraLight','Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',sans-serif";
+    }
+    // KoPub Batang uses "바탕체" in the family name, but it is a proportional
+    // serif publication face, not the Windows fixed-width BatangChe face.
+    if font_family.contains("KoPub바탕체") || lower.contains("kopub batang") {
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',serif";
+    }
+    if font_family.contains("굴림체")
+        || font_family.contains("바탕체")
+        || lower.contains("gulimche")
+        || lower.contains("batangche")
+        || lower.contains("coding")
+        || lower.contains("courier")
+        || lower.contains("mono")
     {
         // Monospace: Windows → 오픈소스 → generic
         return "'GulimChe','굴림체','D2Coding','Noto Sans Mono',monospace";
     }
     // 세리프 키워드 (한글)
-    if font_family.contains("바탕") || font_family.contains("명조")
-        || font_family.contains("궁서")
+    if font_family.contains("바탕") || font_family.contains("명조") || font_family.contains("궁서")
     {
-        // Serif: Windows → macOS(Bold 보유 우선) → macOS 기본 → Android → 오픈소스 → 리눅스 시스템 → generic
+        // Serif: Windows → macOS(Bold 보유 우선) → macOS 기본 → Android → 오픈소스 → 한컴 → 리눅스 시스템 → generic
         // Nanum Myeongjo 는 macOS 10.9+ 기본 설치이며 Bold variant 보유.
         // AppleMyungjo 보다 앞에 두어야 macOS Chrome 에서 CJK 글리프 bold 매칭 성공.
         // 'Source Han Serif K Old Hangul' (Task #528): @font-face unicode-range 가 옛한글
         // 영역 (U+1100-11FF, U+A960-A97F, U+D7B0-D7FF) 만 매칭하므로 일반 한글에 영향 없음.
-        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',serif";
     }
-    // 세리프 키워드 (영문)
-    if lower.contains("times") || lower.contains("hymjre")
-        || lower.contains("palatino") || lower.contains("georgia")
-        || lower.contains("batang") || lower.contains("gungsuh")
+    // 세리프 키워드 (영문) — "serif" 포함하되 "sans" 부분 문자열을 가진 폰트명 전체 제외
+    if lower.contains("times")
+        || lower.contains("hymjre")
+        || lower.contains("palatino")
+        || lower.contains("georgia")
+        || lower.contains("batang")
+        || lower.contains("gungsuh")
+        || (lower.contains("serif") && !lower.contains("sans"))
     {
-        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
+        return "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',serif";
     }
-    // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → generic
+    // Sans-serif: Windows → macOS/iOS → Android → 오픈소스 → 한컴 → generic
     // 'Source Han Serif K Old Hangul' (Task #528): unicode-range 옛한글 자모 영역 한정
-    "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif"
+    // 'Noto Sans KR ExtraLight' (Task #1224): 무거운 Noto CJK Regular 폴백 직전에 삽입해
+    // 한컴 돋움 획 두께에 근접시킴. 시스템 고딕 우선 → 부재 시에만 ExtraLight 매칭.
+    "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR ExtraLight','Noto Sans KR','Pretendard','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',sans-serif"
+}
+
+pub(crate) fn contains_old_hangul_jamo(text: &str) -> bool {
+    text.chars().any(|ch| {
+        let code = ch as u32;
+        matches!(
+            code,
+            0x1100..=0x11FF | 0xA960..=0xA97F | 0xD7B0..=0xD7FF
+        )
+    })
 }
 
 // ============================================================
@@ -725,8 +961,8 @@ pub fn format_number(number: u16, format: NumberFormat) -> String {
 /// 원 문자 변환 (① ~ ⑳, 이후 숫자)
 fn format_circled_digit(n: u16) -> String {
     const CIRCLED: [char; 20] = [
-        '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩',
-        '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳',
+        '①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩', '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱',
+        '⑲', '⑳',
     ];
     if n >= 1 && n <= 20 {
         CIRCLED[(n - 1) as usize].to_string()
@@ -742,10 +978,18 @@ fn format_roman(n: u16, upper: bool) -> String {
     }
 
     let values = [1000, 900, 500, 400, 100, 90, 50, 40, 10, 9, 5, 4, 1];
-    let symbols_upper = ["M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I"];
-    let symbols_lower = ["m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i"];
+    let symbols_upper = [
+        "M", "CM", "D", "CD", "C", "XC", "L", "XL", "X", "IX", "V", "IV", "I",
+    ];
+    let symbols_lower = [
+        "m", "cm", "d", "cd", "c", "xc", "l", "xl", "x", "ix", "v", "iv", "i",
+    ];
 
-    let symbols = if upper { &symbols_upper } else { &symbols_lower };
+    let symbols = if upper {
+        &symbols_upper
+    } else {
+        &symbols_lower
+    };
     let mut result = String::new();
     let mut num = n as i32;
 
@@ -782,7 +1026,9 @@ fn format_latin(n: u16, upper: bool) -> String {
 
 /// 한글 가나다 변환
 fn format_hangul_ganada(n: u16) -> String {
-    const GANADA: [char; 14] = ['가', '나', '다', '라', '마', '바', '사', '아', '자', '차', '카', '타', '파', '하'];
+    const GANADA: [char; 14] = [
+        '가', '나', '다', '라', '마', '바', '사', '아', '자', '차', '카', '타', '파', '하',
+    ];
     if n >= 1 && n <= 14 {
         GANADA[(n - 1) as usize].to_string()
     } else {
@@ -814,7 +1060,11 @@ fn format_hangul_number(n: u16) -> String {
             while g > 0 {
                 let digit = g % 10;
                 if digit > 0 {
-                    let digit_str = if digit == 1 && unit > 0 { "" } else { HANGUL_DIGITS[digit] };
+                    let digit_str = if digit == 1 && unit > 0 {
+                        ""
+                    } else {
+                        HANGUL_DIGITS[digit]
+                    };
                     group_str.insert_str(0, HANGUL_UNITS[unit]);
                     group_str.insert_str(0, digit_str);
                 }
@@ -854,7 +1104,11 @@ fn format_hanja_number(n: u16) -> String {
             while g > 0 {
                 let digit = g % 10;
                 if digit > 0 {
-                    let digit_str = if digit == 1 && unit > 0 { "" } else { HANJA_DIGITS[digit] };
+                    let digit_str = if digit == 1 && unit > 0 {
+                        ""
+                    } else {
+                        HANJA_DIGITS[digit]
+                    };
                     group_str.insert_str(0, HANJA_UNITS[unit]);
                     group_str.insert_str(0, digit_str);
                 }
@@ -876,7 +1130,10 @@ mod tests {
 
     #[test]
     fn test_render_backend_from_str() {
-        assert_eq!(RenderBackend::from_str("canvas"), Some(RenderBackend::Canvas));
+        assert_eq!(
+            RenderBackend::from_str("canvas"),
+            Some(RenderBackend::Canvas)
+        );
         assert_eq!(RenderBackend::from_str("svg"), Some(RenderBackend::Svg));
         assert_eq!(RenderBackend::from_str("html"), Some(RenderBackend::Html));
         assert_eq!(RenderBackend::from_str("unknown"), None);
@@ -903,6 +1160,84 @@ mod tests {
         // A4 @ 96DPI ≈ 793.7 × 1122.5 px
         assert!((w - 793.7).abs() < 1.0);
         assert!((h - 1122.5).abs() < 1.0);
+    }
+
+    /// [Task #1745] 텍스트 혼합 anchor: 표 geometry 로 wrap 띠 도출
+    #[test]
+    fn test_text_anchor_square_table_strip_derives_from_geometry() {
+        use crate::model::control::Control;
+        use crate::model::paragraph::{LineSeg, Paragraph};
+        use crate::model::shape::TextWrap;
+        use crate::model::table::Table;
+
+        let mut table = Table::default();
+        table.common.treat_as_char = false;
+        table.common.text_wrap = TextWrap::Square;
+        table.common.horizontal_offset = 0;
+        table.common.width = 45002;
+        table.common.margin.left = 283;
+        table.common.margin.right = 283;
+
+        let mut para = Paragraph::default();
+        para.text = "■ 약사법 시행령 [별표 2]".to_string();
+        para.line_segs.push(LineSeg {
+            column_start: 0,
+            segment_width: 48188,
+            ..Default::default()
+        });
+        para.controls.push(Control::Table(Box::new(table)));
+
+        // samples/task1745: cs=45568(=45002+283×2), sw=2620(=48188−45568)
+        assert_eq!(text_anchor_square_table_strip(&para), Some((45568, 2620)));
+    }
+
+    /// [Task #1745] 표 단독 anchor(첫 seg 가 이미 wrap 띠) — None (기존 경로 유지)
+    #[test]
+    fn test_text_anchor_square_table_strip_none_for_table_only_anchor() {
+        use crate::model::control::Control;
+        use crate::model::paragraph::{LineSeg, Paragraph};
+        use crate::model::shape::TextWrap;
+        use crate::model::table::Table;
+
+        let mut table = Table::default();
+        table.common.treat_as_char = false;
+        table.common.text_wrap = TextWrap::Square;
+        table.common.width = 20000;
+
+        // 표 단독 anchor: 첫 LINE_SEG 가 이미 띠 (cs>0)
+        let mut para = Paragraph::default();
+        para.text = " ".to_string();
+        para.line_segs.push(LineSeg {
+            column_start: 20600,
+            segment_width: 27000,
+            ..Default::default()
+        });
+        para.controls.push(Control::Table(Box::new(table.clone())));
+        assert_eq!(text_anchor_square_table_strip(&para), None);
+
+        // 텍스트 없는 anchor — None
+        let mut para2 = Paragraph::default();
+        para2.text = String::new();
+        para2.line_segs.push(LineSeg {
+            column_start: 0,
+            segment_width: 48188,
+            ..Default::default()
+        });
+        para2.controls.push(Control::Table(Box::new(table.clone())));
+        assert_eq!(text_anchor_square_table_strip(&para2), None);
+
+        // 띠 폭이 남지 않는 표(전폭) — None
+        let mut wide = table.clone();
+        wide.common.width = 48188;
+        let mut para3 = Paragraph::default();
+        para3.text = "제목".to_string();
+        para3.line_segs.push(LineSeg {
+            column_start: 0,
+            segment_width: 48188,
+            ..Default::default()
+        });
+        para3.controls.push(Control::Table(Box::new(wide)));
+        assert_eq!(text_anchor_square_table_strip(&para3), None);
     }
 
     #[test]
@@ -950,8 +1285,10 @@ mod tests {
 
     #[test]
     fn test_generic_fallback() {
-        let serif = "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','Source Han Serif K Old Hangul',serif";
-        let sans = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR','Pretendard','Source Han Serif K Old Hangul',sans-serif";
+        let serif = "'Batang','바탕','Nanum Myeongjo','AppleMyungjo','Noto Serif KR','Noto Serif CJK KR','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',serif";
+        let sans = "'Malgun Gothic','맑은 고딕','Apple SD Gothic Neo','Noto Sans KR ExtraLight','Noto Sans KR','Pretendard','HCR Batang Ext-B','함초롬바탕 확장B','HCR Batang Ext','함초롬바탕 확장','HCR Batang','함초롬바탕','Source Han Serif K Old Hangul',sans-serif";
+        // Task #1224: ExtraLight 가 무거운 Noto 직전에 위치하는지 명시 검증
+        assert!(sans.contains("'Noto Sans KR ExtraLight','Noto Sans KR'"));
         let mono = "'GulimChe','굴림체','D2Coding','Noto Sans Mono',monospace";
         // 세리프 계열
         assert_eq!(generic_fallback("함초롬바탕"), serif);
@@ -960,18 +1297,67 @@ mod tests {
         assert_eq!(generic_fallback("HY견명조"), serif);
         assert_eq!(generic_fallback("Times New Roman"), serif);
         assert_eq!(generic_fallback("Palatino Linotype"), serif);
+        // KoPub바탕체는 이름에 "바탕체"가 들어가지만 고정폭 BatangChe가 아니라
+        // 비례폭 본문/제목용 세리프 계열이다.
+        assert_eq!(generic_fallback("KoPub바탕체 Light"), serif);
+        assert_eq!(generic_fallback("KoPub바탕체 Medium"), serif);
+        assert_eq!(generic_fallback("KoPub Batang Medium"), serif);
         // 산세리프 계열
         assert_eq!(generic_fallback("함초롬돋움"), sans);
         assert_eq!(generic_fallback("돋움"), sans);
         assert_eq!(generic_fallback("굴림"), sans);
         assert_eq!(generic_fallback("Arial"), sans);
         assert_eq!(generic_fallback("맑은 고딕"), sans);
+        assert!(generic_fallback("KoPub돋움체 Light")
+            .starts_with("'Noto Sans KR ExtraLight','Malgun Gothic'"));
+        assert!(generic_fallback("KoPub Dotum Light")
+            .starts_with("'Noto Sans KR ExtraLight','Malgun Gothic'"));
         // 고정폭 계열
         assert_eq!(generic_fallback("굴림체"), mono);
         assert_eq!(generic_fallback("바탕체"), mono);
         assert_eq!(generic_fallback("Courier New"), mono);
+        assert_eq!(generic_fallback("D2Coding ligature"), mono);
+        assert_eq!(generic_fallback("Noto Sans Mono"), mono);
+        // 영문 세리프 (issue #616)
+        assert_eq!(generic_fallback("Noto Serif CJK SC"), serif);
+        assert_eq!(generic_fallback("Liberation Serif"), serif);
+        assert_eq!(generic_fallback("Noto Serif KR"), serif);
+        // "sans" 포함 폰트는 세리프로 분류되지 않음
+        assert_eq!(generic_fallback("Liberation Sans"), sans);
+        assert_eq!(generic_fallback("Noto Sans KR"), sans);
         // 빈 문자열
         assert_eq!(generic_fallback(""), sans);
+    }
+
+    #[test]
+    fn test_medium_weight_face() {
+        use crate::renderer::style_resolver::is_medium_weight_face;
+        assert!(is_medium_weight_face("HY중고딕"));
+        assert!(is_medium_weight_face("신명 중고딕"));
+        assert!(is_medium_weight_face("한양중고딕"));
+        assert!(is_medium_weight_face("HY태고딕"));
+        assert!(is_medium_weight_face("신명 태고딕"));
+        assert!(!is_medium_weight_face("HY헤드라인M"));
+        assert!(!is_medium_weight_face("돋움"));
+        assert!(!is_medium_weight_face("바탕"));
+        assert!(!is_medium_weight_face("맑은 고딕"));
+        assert!(!is_medium_weight_face(""));
+    }
+
+    #[test]
+    fn test_explicit_face_weight_hints() {
+        let light = TextStyle {
+            font_family: "KoPub돋움체 Light".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(light.css_font_weight(), Some("300"));
+
+        let bold = TextStyle {
+            font_family: "KoPub바탕체 Bold".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(bold.css_font_weight(), Some("bold"));
+        assert!(bold.is_visually_bold());
     }
 
     #[test]

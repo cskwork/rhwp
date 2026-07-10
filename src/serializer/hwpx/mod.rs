@@ -13,7 +13,10 @@ pub mod content;
 pub mod context;
 pub mod field;
 pub mod fixtures;
+pub mod form;
 pub mod header;
+pub mod master_page;
+pub mod package_check;
 pub mod picture;
 pub mod roundtrip;
 pub mod section;
@@ -24,8 +27,9 @@ pub mod utils;
 pub mod writer;
 
 use std::collections::HashSet;
+use std::fmt::Write as _;
 
-use crate::model::document::Document;
+use crate::model::document::{Document, HWP5_ORIGIN_HWPX_MARKER_PATH};
 
 use super::SerializeError;
 use content::BinDataEntry as ContentBinDataEntry;
@@ -48,8 +52,14 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     // 1. mimetype (반드시 최초 엔트리, STORED, extra field 없음)
     z.write_stored("mimetype", b"application/hwp+zip")?;
 
-    // 2. version.xml
-    z.write_deflated("version.xml", VERSION_XML.as_bytes())?;
+    // 2. version.xml — 원본 보존 우선 (없으면 하드코딩 상수).
+    //    하드코딩 상수는 Windows/특정 빌드 고정값이라 한컴 변환본의 실제 플랫폼
+    //    버전을 덮어쓴다. 원본 보조 엔트리가 있으면 그대로 출력한다.
+    z.write_deflated(
+        "version.xml",
+        doc.hwpx_aux_entry("version.xml")
+            .unwrap_or_else(|| VERSION_XML.as_bytes()),
+    )?;
 
     // 3. Contents/header.xml — Stage 1 동적 생성 (IR 기반)
     let header_xml = header::write_header(doc, &ctx)?;
@@ -64,15 +74,50 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
         z.write_deflated(&section_hrefs[i], &xml)?;
     }
 
-    // 5. Preview/PrvText.txt + Preview/PrvImage.png
-    z.write_deflated("Preview/PrvText.txt", PRV_TEXT)?;
-    z.write_deflated("Preview/PrvImage.png", PRV_IMAGE_PNG)?;
+    // 4b. Contents/masterpage{N}.xml — 바탕쪽 (전 섹션 누적 전역 인덱스).
+    //     id/href 의 인덱스는 section.rs 의 idRef 인덱스와 동일 규칙(전역 누적)이라
+    //     별도 공유 상태 없이 정합한다.
+    let mut master_items: Vec<(String, String)> = Vec::new();
+    let mut mp_global = 0usize;
+    for sec in &doc.sections {
+        for mp in &sec.section_def.master_pages {
+            let id = format!("masterpage{}", mp_global);
+            let href = format!("Contents/masterpage{}.xml", mp_global);
+            let xml = master_page::render_master_page_xml(mp, &id, &mut ctx);
+            z.write_deflated(&href, xml.as_bytes())?;
+            master_items.push((id, href));
+            mp_global += 1;
+        }
+    }
 
-    // 6. settings.xml
-    z.write_deflated("settings.xml", SETTINGS_XML.as_bytes())?;
+    // 5. Preview/PrvText.txt + Preview/PrvImage.png — 원본 보존 우선.
+    //    하드코딩 상수는 빈/placeholder 미리보기라 원본 썸네일·미리보기 텍스트를
+    //    잃는다. 보조 엔트리가 있으면 원본을 그대로 출력한다.
+    z.write_deflated(
+        "Preview/PrvText.txt",
+        doc.hwpx_aux_entry("Preview/PrvText.txt")
+            .unwrap_or(PRV_TEXT),
+    )?;
+    z.write_deflated(
+        "Preview/PrvImage.png",
+        doc.hwpx_aux_entry("Preview/PrvImage.png")
+            .unwrap_or(PRV_IMAGE_PNG),
+    )?;
 
-    // 7. META-INF/container.rdf
-    z.write_deflated("META-INF/container.rdf", META_INF_CONTAINER_RDF.as_bytes())?;
+    // 6. settings.xml — 원본 보존 우선.
+    //    하드코딩 상수는 PrintInfo(확대/인쇄 설정) 등을 빠뜨린다.
+    z.write_deflated(
+        "settings.xml",
+        doc.hwpx_aux_entry("settings.xml")
+            .unwrap_or_else(|| SETTINGS_XML.as_bytes()),
+    )?;
+
+    // 7. META-INF/container.rdf — header + every section part.
+    // Hancom uses this RDF graph alongside content.hpf; a stale one-section
+    // RDF makes multi-section documents fail to open even when the ZIP and
+    // content.hpf contain every section.
+    let container_rdf = write_container_rdf(&section_hrefs);
+    z.write_deflated("META-INF/container.rdf", container_rdf.as_bytes())?;
 
     // 8. BinData ZIP 엔트리 (Stage 4)
     //    `ctx.bin_data_map` 의 엔트리 순서대로 실제 바이너리를 ZIP에 추가.
@@ -80,6 +125,10 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     let bin_entries = ctx.bin_data_entries();
     let mut zip_bin_entries: HashSet<String> = HashSet::new();
     for entry in &bin_entries {
+        // 외부 참조(isEmbeded=0)는 ZIP 엔트리가 없다 — manifest 항목만 방출 (#1891).
+        if !entry.is_embedded {
+            continue;
+        }
         let data = doc
             .bin_data_content
             .iter()
@@ -101,9 +150,15 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
             id: e.manifest_id.clone(),
             href: e.href.clone(),
             media_type: e.media_type.clone(),
+            is_embedded: e.is_embedded,
         })
         .collect();
-    let content_hpf = content::write_content_hpf(&section_hrefs, &content_bin_entries)?;
+    let content_hpf = content::write_content_hpf(
+        &section_hrefs,
+        &content_bin_entries,
+        &master_items,
+        doc.hwpx_aux_entry("Contents/content.hpf"),
+    )?;
     z.write_deflated("Contents/content.hpf", &content_hpf)?;
 
     // 10. META-INF/container.xml
@@ -111,6 +166,12 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
 
     // 11. META-INF/manifest.xml
     z.write_deflated("META-INF/manifest.xml", META_INF_MANIFEST_XML.as_bytes())?;
+
+    // HWP5-origin HWPX marker — HWP5에서 HWPX로 export한 산출물은 HWPX 컨테이너라도
+    // lineSeg 부재/pagination 시멘틱을 HWP5 원본처럼 해석해야 자기정합한다.
+    if let Some(marker) = doc.hwpx_aux_entry(HWP5_ORIGIN_HWPX_MARKER_PATH) {
+        z.write_deflated(HWP5_ORIGIN_HWPX_MARKER_PATH, marker)?;
+    }
 
     // 참조 정합성 단언 (Stage 1+)
     ctx.assert_all_refs_resolved()?;
@@ -125,13 +186,53 @@ pub fn serialize_hwpx(doc: &Document) -> Result<Vec<u8>, SerializeError> {
     z.finish()
 }
 
+fn write_container_rdf(section_hrefs: &[String]) -> String {
+    const PKG_NS: &str = "http://www.hancom.co.kr/hwpml/2016/meta/pkg#";
+
+    let mut out = String::new();
+    out.push_str(r#"<?xml version="1.0" encoding="UTF-8" standalone="yes" ?>"#);
+    out.push_str(r#"<rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#">"#);
+    out.push_str(r#"<rdf:Description rdf:about="">"#);
+    let _ = write!(
+        out,
+        r#"<ns0:hasPart xmlns:ns0="{PKG_NS}" rdf:resource="Contents/header.xml"/>"#
+    );
+    out.push_str(r#"</rdf:Description>"#);
+    out.push_str(r#"<rdf:Description rdf:about="Contents/header.xml">"#);
+    let _ = write!(out, r#"<rdf:type rdf:resource="{PKG_NS}HeaderFile"/>"#);
+    out.push_str(r#"</rdf:Description>"#);
+
+    for href in section_hrefs {
+        out.push_str(r#"<rdf:Description rdf:about="">"#);
+        let _ = write!(
+            out,
+            r#"<ns0:hasPart xmlns:ns0="{PKG_NS}" rdf:resource="{href}"/>"#
+        );
+        out.push_str(r#"</rdf:Description>"#);
+        let _ = write!(out, r#"<rdf:Description rdf:about="{href}">"#);
+        let _ = write!(out, r#"<rdf:type rdf:resource="{PKG_NS}SectionFile"/>"#);
+        out.push_str(r#"</rdf:Description>"#);
+    }
+
+    out.push_str(r#"<rdf:Description rdf:about="">"#);
+    let _ = write!(out, r#"<rdf:type rdf:resource="{PKG_NS}Document"/>"#);
+    out.push_str(r#"</rdf:Description>"#);
+    out.push_str(r#"</rdf:RDF>"#);
+    out
+}
+
 /// 3-way BinData 동기화 단언: `ctx.bin_data_entries()`, content.hpf manifest,
 /// ZIP entry 의 href 집합이 모두 일치하는지 확인.
+/// 외부 참조(isEmbeded=0) 항목은 ZIP 엔트리가 없는 것이 정상이므로 제외한다 (#1891).
 fn assert_bin_data_3way(
     bin_entries: &[context::BinDataEntry],
     zip_entries: &HashSet<String>,
 ) -> Result<(), SerializeError> {
-    let ctx_hrefs: HashSet<String> = bin_entries.iter().map(|e| e.href.clone()).collect();
+    let ctx_hrefs: HashSet<String> = bin_entries
+        .iter()
+        .filter(|e| e.is_embedded)
+        .map(|e| e.href.clone())
+        .collect();
     if ctx_hrefs != *zip_entries {
         let missing_zip: Vec<_> = ctx_hrefs.difference(zip_entries).cloned().collect();
         let orphan_zip: Vec<_> = zip_entries.difference(&ctx_hrefs).cloned().collect();
@@ -145,6 +246,8 @@ fn assert_bin_data_3way(
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+
     use super::*;
     use crate::parser::hwpx::parse_hwpx;
 
@@ -157,13 +260,209 @@ mod tests {
         assert!(parsed.bin_data_content.is_empty());
     }
 
+    /// 보조 엔트리(version.xml/settings.xml/Preview/*)가 보존된 경우,
+    /// 직렬화기는 하드코딩 상수가 아니라 원본 바이트를 그대로 출력해야 한다.
+    /// (한컴 변환본 라운드트립 무손실 보장)
+    #[test]
+    fn aux_entries_passthrough_verbatim() {
+        let mut doc = Document::default();
+        let custom: &[(&str, &[u8])] = &[
+            ("version.xml", b"<custom-version platform=\"Mac\"/>"),
+            ("settings.xml", b"<custom-settings printInfo=\"on\"/>"),
+            ("Preview/PrvText.txt", b"preview body text"),
+            ("Preview/PrvImage.png", &[0x89, b'P', b'N', b'G', 1, 2, 3]),
+        ];
+        doc.hwpx_aux_entries = custom
+            .iter()
+            .map(|(p, d)| (p.to_string(), d.to_vec()))
+            .collect();
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        for (path, expected) in custom {
+            let mut entry = archive
+                .by_name(path)
+                .unwrap_or_else(|_| panic!("missing entry {path}"));
+            let mut got = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut got).expect("read");
+            assert_eq!(&got, expected, "{path} not passed through verbatim");
+        }
+    }
+
+    /// 보조 엔트리가 없으면(HWP5 등) 하드코딩 상수로 폴백한다.
+    #[test]
+    fn aux_entries_fallback_to_constants() {
+        let doc = Document::default();
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        let mut entry = archive.by_name("version.xml").expect("version.xml");
+        let mut got = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut got).expect("read");
+        assert_eq!(got, static_assets::VERSION_XML.as_bytes());
+    }
+
     #[test]
     fn serialize_with_one_section_parses_back() {
         let mut doc = Document::default();
-        doc.sections.push(crate::model::document::Section::default());
+        doc.sections
+            .push(crate::model::document::Section::default());
         let bytes = serialize_hwpx(&doc).expect("serialize one-section");
         let parsed = parse_hwpx(&bytes).expect("parse back");
         assert_eq!(parsed.sections.len(), 1);
+    }
+
+    #[test]
+    fn master_pages_are_serialized_as_package_parts() {
+        use crate::model::document::Section;
+        use crate::model::header_footer::{HeaderFooterApply, MasterPage};
+        use crate::model::paragraph::Paragraph;
+        use crate::serializer::hwpx::package_check::check_package;
+
+        let mut doc = Document::default();
+        let mut section0 = Section::default();
+        let mut section1 = Section::default();
+
+        let mut first_master_para = Paragraph::default();
+        first_master_para.text = "first master".to_string();
+        section0.section_def.master_pages.push(MasterPage {
+            apply_to: HeaderFooterApply::Both,
+            text_width: 10_000,
+            text_height: 10_000,
+            text_ref: 1,
+            paragraphs: vec![first_master_para],
+            ..Default::default()
+        });
+
+        let mut second_master_para = Paragraph::default();
+        second_master_para.text = "second master".to_string();
+        section1.section_def.master_pages.push(MasterPage {
+            apply_to: HeaderFooterApply::Odd,
+            text_width: 12_000,
+            text_height: 8_000,
+            text_ref: 1,
+            paragraphs: vec![second_master_para],
+            ..Default::default()
+        });
+
+        doc.sections.push(section0);
+        doc.sections.push(section1);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize master pages");
+        let report = check_package(&bytes, &doc);
+        assert!(report.is_ok(), "problems: {}", report.summary());
+
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        for name in ["Contents/masterpage0.xml", "Contents/masterpage1.xml"] {
+            archive
+                .by_name(name)
+                .unwrap_or_else(|_| panic!("missing {name}"));
+        }
+
+        let mut content_hpf = String::new();
+        archive
+            .by_name("Contents/content.hpf")
+            .expect("content.hpf")
+            .read_to_string(&mut content_hpf)
+            .expect("read content.hpf");
+        assert!(content_hpf.contains(r#"id="masterpage0""#));
+        assert!(content_hpf.contains(r#"href="Contents/masterpage1.xml""#));
+
+        let mut section1_xml = String::new();
+        archive
+            .by_name("Contents/section1.xml")
+            .expect("section1")
+            .read_to_string(&mut section1_xml)
+            .expect("read section1");
+        assert!(section1_xml.contains(r#"masterPageCnt="1""#));
+        assert!(section1_xml.contains(r#"idRef="masterpage1""#));
+
+        drop(archive);
+        let parsed = parse_hwpx(&bytes).expect("parse back");
+        assert_eq!(parsed.sections[0].section_def.master_pages.len(), 1);
+        assert_eq!(parsed.sections[1].section_def.master_pages.len(), 1);
+        assert_eq!(
+            parsed.sections[1].section_def.master_pages[0].apply_to,
+            HeaderFooterApply::Odd
+        );
+    }
+
+    #[test]
+    fn container_rdf_lists_every_section() {
+        let mut doc = Document::default();
+        for _ in 0..3 {
+            doc.sections
+                .push(crate::model::document::Section::default());
+        }
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        let mut container_rdf = String::new();
+        archive
+            .by_name("META-INF/container.rdf")
+            .expect("container.rdf")
+            .read_to_string(&mut container_rdf)
+            .expect("read container.rdf");
+
+        assert!(container_rdf.contains(r#"rdf:resource="Contents/header.xml""#));
+        for i in 0..3 {
+            let href = format!("Contents/section{i}.xml");
+            assert!(
+                container_rdf.contains(&format!(r#"rdf:resource="{href}""#)),
+                "missing hasPart for {href}: {container_rdf}"
+            );
+            assert!(
+                container_rdf.contains(&format!(r#"rdf:about="{href}""#)),
+                "missing type description for {href}: {container_rdf}"
+            );
+        }
+    }
+
+    #[test]
+    fn header_footer_ids_are_preserved() {
+        use crate::model::control::Control;
+        use crate::model::document::Section;
+        use crate::model::header_footer::{Footer, Header, HeaderFooterApply};
+        use crate::model::paragraph::Paragraph;
+
+        let mut doc = Document::default();
+        let mut section = Section::default();
+        let mut para = Paragraph::default();
+
+        para.controls.push(Control::Footer(Box::new(Footer {
+            raw_ctrl_extra: 2u32.to_le_bytes().to_vec(),
+            apply_to: HeaderFooterApply::Even,
+            ..Default::default()
+        })));
+        para.controls.push(Control::Header(Box::new(Header {
+            raw_ctrl_extra: 1u32.to_le_bytes().to_vec(),
+            apply_to: HeaderFooterApply::Odd,
+            ..Default::default()
+        })));
+        section.paragraphs.push(para);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize header/footer ids");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        let mut section0_xml = String::new();
+        archive
+            .by_name("Contents/section0.xml")
+            .expect("section0")
+            .read_to_string(&mut section0_xml)
+            .expect("read section0");
+
+        assert!(
+            section0_xml.contains(r#"<hp:footer id="2" applyPageType="EVEN">"#),
+            "footer id not preserved: {section0_xml}"
+        );
+        assert!(
+            section0_xml.contains(r#"<hp:header id="1" applyPageType="ODD">"#),
+            "header id not preserved: {section0_xml}"
+        );
     }
 
     #[test]
@@ -216,15 +515,20 @@ mod tests {
         std::io::Read::read_to_string(&mut sec0, &mut xml).expect("read");
         // Stage 2.3 (ref_mixed 기반): 혼합 콘텐츠 + tab 속성 포함
         assert!(
-            xml.contains(r#"<hp:t>A<hp:tab width="4000" leader="0" type="1"/>B<hp:lineBreak/>C</hp:t>"#),
-            "mixed content not rendered: {}", xml
+            xml.contains(
+                r#"<hp:t>A<hp:tab width="4000" leader="0" type="1"/>B<hp:lineBreak/>C</hp:t>"#
+            ),
+            "mixed content not rendered: {}",
+            xml
         );
     }
 
     #[test]
     fn equation_control_roundtrip_preserves_script() {
         use crate::model::control::{Control, Equation};
-        use crate::model::shape::{CommonObjAttr, HorzAlign, HorzRelTo, TextWrap, VertAlign, VertRelTo};
+        use crate::model::shape::{
+            CommonObjAttr, HorzAlign, HorzRelTo, TextWrap, VertAlign, VertRelTo,
+        };
         use crate::model::Padding;
 
         let mut doc = Document::default();
@@ -241,7 +545,12 @@ mod tests {
                 height: 1200,
                 vertical_offset: 80,
                 horizontal_offset: 160,
-                margin: Padding { left: 10, right: 20, top: 30, bottom: 40 },
+                margin: Padding {
+                    left: 10,
+                    right: 20,
+                    top: 30,
+                    bottom: 40,
+                },
                 treat_as_char: true,
                 text_wrap: TextWrap::TopAndBottom,
                 vert_rel_to: VertRelTo::Para,
@@ -254,6 +563,7 @@ mod tests {
             font_size: 1000,
             color: 0x000000FF,
             baseline: 120,
+            unknown: 0,
             font_name: "HYhwpEQ".to_string(),
             version_info: "Equation Version 60".to_string(),
             raw_ctrl_data: Vec::new(),
@@ -316,6 +626,60 @@ mod tests {
     }
 
     #[test]
+    fn task1655_equation_flow_with_text_roundtrips() {
+        use crate::model::control::{Control, Equation};
+        use crate::model::shape::CommonObjAttr;
+
+        let mut doc = Document::default();
+        let mut section = crate::model::document::Section::default();
+        let mut para = crate::model::paragraph::Paragraph::default();
+        para.text = "A".to_string();
+        para.char_offsets = vec![0];
+        para.char_count = 9;
+        para.controls.push(Control::Equation(Box::new(Equation {
+            common: CommonObjAttr {
+                width: 1600,
+                height: 900,
+                treat_as_char: true,
+                flow_with_text: false,
+                ..Default::default()
+            },
+            script: "a+b".to_string(),
+            font_size: 1000,
+            ..Default::default()
+        })));
+        section.paragraphs.push(para);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize equation");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        let mut sec0 = archive.by_name("Contents/section0.xml").expect("section0");
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut sec0, &mut xml).expect("read");
+        assert!(
+            xml.contains(r#"flowWithText="0""#),
+            "수식 flowWithText=false 는 0으로 방출되어야 한다: {}",
+            xml
+        );
+        drop(sec0);
+
+        let parsed = parse_hwpx(&bytes).expect("parse back");
+        let parsed_eq = parsed.sections[0].paragraphs[0]
+            .controls
+            .iter()
+            .find_map(|ctrl| match ctrl {
+                Control::Equation(eq) => Some(eq),
+                _ => None,
+            })
+            .expect("equation control");
+        assert!(
+            !parsed_eq.common.flow_with_text,
+            "수식 flowWithText=false 는 재파싱 뒤에도 보존되어야 한다"
+        );
+    }
+
+    #[test]
     fn equation_control_between_text_runs_roundtrips_position() {
         use crate::model::control::{Control, Equation};
         use crate::model::page::ColumnDef;
@@ -324,14 +688,16 @@ mod tests {
 
         let mut doc = Document::default();
         // Table::default() 의 border_fill_id(0) 가 검증을 통과하도록 등록
-        doc.doc_info.border_fills.push(crate::model::style::BorderFill::default());
+        doc.doc_info
+            .border_fills
+            .push(crate::model::style::BorderFill::default());
         let mut section = crate::model::document::Section::default();
         let mut para = crate::model::paragraph::Paragraph::default();
         para.text = "ACB".to_string();
         para.char_offsets = vec![0, 9, 18];
         para.char_count = 20;
         para.controls.push(Control::ColumnDef(ColumnDef::default()));
-        para.controls.push(Control::Table(Box::new(Table::default())));
+        para.controls.push(Control::Table(Box::default()));
         para.controls.push(Control::Equation(Box::new(Equation {
             common: CommonObjAttr {
                 width: 1000,
@@ -361,6 +727,265 @@ mod tests {
             a_pos < c_pos && c_pos < eq_pos && eq_pos < b_pos,
             "equation must stay after non-equation inline slots: {}",
             xml
+        );
+    }
+
+    #[test]
+    fn task1587_ruby_control_roundtrips() {
+        // Ruby(덧말) 컨트롤은 is_hwpx_inline_slot 에 등록돼 슬롯으로 인식되나
+        // render_control_slot 에 방출 arm 이 없어 저장 시 드롭된다(controls=[]).
+        // 수정 전: reparse 후 Ruby 소실 → RED. 수정 후: 보존 → GREEN.
+        use crate::model::control::{Control, Ruby};
+
+        let mut doc = Document::default();
+        let mut section = crate::model::document::Section::default();
+        let mut para = crate::model::paragraph::Paragraph::default();
+        para.text = "ab".to_string();
+        para.char_offsets = vec![0, 9];
+        para.char_count = 11; // (11-1-2)/8 = 1 슬롯
+        para.controls.push(Control::Ruby(Ruby {
+            main_text: "기준글".to_string(),
+            ruby_text: "덧말".to_string(),
+            pos_type: 1, // BOTTOM
+            align: 2,    // CENTER
+            sz_ratio: 80,
+            option: 3,
+            style_id_ref: 5,
+        }));
+        section.paragraphs.push(para);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize ruby");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&bytes).expect("parse");
+        let rubies: Vec<_> = doc2.sections[0].paragraphs[0]
+            .controls
+            .iter()
+            .filter_map(|c| match c {
+                Control::Ruby(r) => Some(r),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            rubies.len(),
+            1,
+            "Ruby 컨트롤이 roundtrip 후 보존돼야 한다 (현재 드롭): {:?}",
+            doc2.sections[0].paragraphs[0].controls
+        );
+        let r = rubies[0];
+        // 전 필드 무손실 (#1587 — mainText/posType/align/szRatio/option/styleIDRef)
+        assert_eq!(r.main_text, "기준글", "mainText 보존");
+        assert_eq!(r.ruby_text, "덧말", "subText(덧말) 보존");
+        assert_eq!(r.pos_type, 1, "posType(BOTTOM) 보존");
+        assert_eq!(r.align, 2, "align(CENTER) 보존");
+        assert_eq!(r.sz_ratio, 80, "szRatio 보존");
+        assert_eq!(r.option, 3, "option 보존");
+        assert_eq!(r.style_id_ref, 5, "styleIDRef 보존");
+    }
+
+    #[test]
+    fn task1591_bookmark_not_hoisted_before_slot() {
+        // [#1591] 북마크가 슬롯 컨트롤(표 등) 뒤에 있을 때, 직렬화기가 북마크를 문단
+        // 시작으로 hoisting 하면 컨트롤 순서가 뒤바뀐다. [#1591 v2] 슬롯 있는 문단의
+        // 북마크 in-order 방출로 수정 — GREEN 전환 (1라운드 RED, 순서 보존 가드).
+        use crate::model::control::{Bookmark, Control};
+        use crate::model::style::BorderFill;
+        use crate::model::table::Table;
+
+        let mut doc = Document::default();
+        doc.doc_info.border_fills.push(BorderFill::default());
+        let mut section = crate::model::document::Section::default();
+        section
+            .paragraphs
+            .push(crate::model::paragraph::Paragraph::default()); // para0 더미
+        let mut p = crate::model::paragraph::Paragraph::default();
+        p.text = "AB".to_string();
+        p.char_offsets = vec![0, 9]; // A@0, [표 슬롯 8], B@9
+        p.char_count = 11;
+        p.controls.push(Control::Table(Box::<Table>::default()));
+        p.controls.push(Control::Bookmark(Bookmark {
+            name: "bm".to_string(),
+        }));
+        section.paragraphs.push(p);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&bytes).expect("parse");
+        let ctrls: Vec<&str> = doc2.sections[0].paragraphs[1]
+            .controls
+            .iter()
+            .map(|c| match c {
+                Control::Table(_) => "tbl",
+                Control::Bookmark(_) => "bm",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            ctrls,
+            vec!["tbl", "bm"],
+            "북마크가 표 뒤 위치를 보존해야 한다 (hoisting 시 [bm,tbl] 로 뒤바뀜)"
+        );
+    }
+
+    #[test]
+    fn task1591v2_first_para_hidden_slot_char_shape_position() {
+        // [#1591 v2, Class C1 — 36384689 동형] 첫 문단의 hidden 슬롯(secPr/템플릿 흡수
+        // colPr)이 cc 축 8유닛을 점유하는 문서: 종전엔 slot_count(4) != slots.len() 로
+        // mismatch 폴백이 후위 슬롯(pageNum)을 char-offset 없이 방출해 char_shape 경계가
+        // (24,·)→(32,·) +8 시프트. hidden 정합으로 메인 경로에 진입해 경계 24 가 보존된다.
+        use crate::model::control::{Bookmark, Control, PageNumberPos};
+        use crate::model::document::SectionDef;
+        use crate::model::page::ColumnDef;
+        use crate::model::paragraph::CharShapeRef;
+        use crate::model::style::{BorderFill, CharShape};
+        use crate::model::table::Table;
+
+        let mut doc = Document::default();
+        doc.doc_info.border_fills.push(BorderFill::default());
+        doc.doc_info.char_shapes.push(CharShape::default()); // id 0
+        doc.doc_info.char_shapes.push(CharShape::default()); // id 1
+        let mut section = crate::model::document::Section::default();
+        let mut p = crate::model::paragraph::Paragraph::default();
+        p.text = String::new();
+        p.char_count = 33; // [secd 0..8][cold 8..16][tbl 16..24][pageNum 24..32] + 1
+        p.char_shapes = vec![
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 0,
+            },
+            CharShapeRef {
+                start_pos: 24,
+                char_shape_id: 1,
+            },
+        ];
+        p.controls
+            .push(Control::SectionDef(Box::<SectionDef>::default()));
+        p.controls.push(Control::ColumnDef(ColumnDef::default()));
+        p.controls.push(Control::Table(Box::<Table>::default()));
+        p.controls
+            .push(Control::PageNumberPos(PageNumberPos::default()));
+        p.controls.push(Control::Bookmark(Bookmark {
+            name: "별첨 1".to_string(),
+        }));
+        section.paragraphs.push(p);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&bytes).expect("parse");
+        let p2 = &doc2.sections[0].paragraphs[0];
+        let positions: Vec<u32> = p2.char_shapes.iter().map(|cs| cs.start_pos).collect();
+        assert_eq!(
+            positions,
+            vec![0, 24],
+            "char_shape 경계가 24 에 보존돼야 한다 (mismatch 폴백 시 +8 → 32)"
+        );
+        let ctrls: Vec<&str> = p2
+            .controls
+            .iter()
+            .map(|c| match c {
+                Control::SectionDef(_) => "secd",
+                Control::ColumnDef(_) => "cold",
+                Control::Table(_) => "tbl",
+                Control::PageNumberPos(_) => "pagenum",
+                Control::Bookmark(_) => "bm",
+                _ => "?",
+            })
+            .collect();
+        assert_eq!(
+            ctrls,
+            vec!["secd", "cold", "tbl", "pagenum", "bm"],
+            "컨트롤 순서(표·pageNum 뒤 북마크) 보존"
+        );
+    }
+
+    #[test]
+    fn task1593_first_para_same_para_field_end_preserved() {
+        // [#1593, Class C2 — 36388711 동형] 첫 문단(hidden 슬롯 점유)의 same-para 균형
+        // 필드: 종전 mismatch 폴백은 fieldBegin(슬롯)만 방출하고 닫는 fieldEnd 를
+        // 소실시켜 cc −8 + 후속 char_shape 경계 −8. hidden 정합 후 메인 경로가
+        // fieldEnd 를 위치대로 방출해 cc·경계가 보존된다.
+        use crate::model::control::{Bookmark, Control, Field};
+        use crate::model::document::SectionDef;
+        use crate::model::page::ColumnDef;
+        use crate::model::paragraph::{CharShapeRef, FieldRange};
+        use crate::model::style::CharShape;
+
+        let mut doc = Document::default();
+        doc.doc_info.char_shapes.push(CharShape::default()); // id 0
+        doc.doc_info.char_shapes.push(CharShape::default()); // id 1
+        let mut section = crate::model::document::Section::default();
+        let mut p = crate::model::paragraph::Paragraph::default();
+        // [secd 0..8][cold 8..16][fieldBegin 16..24] A@24 [fieldEnd 25..33] B@33 → cc 35
+        p.text = "AB".to_string();
+        p.char_offsets = vec![24, 33];
+        p.char_count = 35;
+        p.char_shapes = vec![
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 0,
+            },
+            CharShapeRef {
+                start_pos: 33,
+                char_shape_id: 1,
+            },
+        ];
+        p.controls
+            .push(Control::SectionDef(Box::<SectionDef>::default()));
+        p.controls.push(Control::ColumnDef(ColumnDef::default()));
+        p.controls.push(Control::Field(Field::default()));
+        p.controls.push(Control::Bookmark(Bookmark {
+            name: "bm".to_string(),
+        }));
+        p.field_ranges = vec![FieldRange {
+            start_char_idx: 0,
+            end_char_idx: 1,
+            control_idx: 2,
+        }];
+        section.paragraphs.push(p);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&bytes).expect("parse");
+        let p2 = &doc2.sections[0].paragraphs[0];
+        assert_eq!(
+            p2.field_ranges.len(),
+            1,
+            "same-para 균형 필드(fieldBegin/End 1/1)가 보존돼야 한다 (종전: fieldEnd 드롭)"
+        );
+        assert_eq!(p2.char_count, 35, "fieldEnd 8유닛 보존 → cc 불변");
+        let positions: Vec<u32> = p2.char_shapes.iter().map(|cs| cs.start_pos).collect();
+        assert_eq!(
+            positions,
+            vec![0, 33],
+            "후속 char_shape 경계 보존 (종전 −8)"
+        );
+    }
+
+    #[test]
+    fn task1592_empty_paragraph_no_spurious_charshape() {
+        // [#1592] run 이 없던 완전 빈 문단(char_shapes=[])에 직렬화기가 빈
+        // <hp:run charPrIDRef="0"> 를 추가하면 재파싱 시 char_shapes 가 [(0,0)] 으로 생긴다.
+        // 비-첫 문단으로 구성(첫 문단 템플릿 회피).
+        let mut doc = Document::default();
+        let mut section = crate::model::document::Section::default();
+        // para0: 텍스트 있는 일반 문단
+        let mut p0 = crate::model::paragraph::Paragraph::default();
+        p0.text = "본문".to_string();
+        section.paragraphs.push(p0);
+        // para1: 완전 빈 문단 (text="", char_shapes=[], controls=[])
+        section
+            .paragraphs
+            .push(crate::model::paragraph::Paragraph::default());
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let doc2 = crate::parser::hwpx::parse_hwpx(&bytes).expect("parse");
+        let cs = &doc2.sections[0].paragraphs[1].char_shapes;
+        assert!(
+            cs.is_empty(),
+            "빈 문단은 char_shapes 가 비어야 한다 (spurious (0,0) 금지): {:?}",
+            cs.iter()
+                .map(|c| (c.start_pos, c.char_shape_id))
+                .collect::<Vec<_>>()
         );
     }
 
@@ -468,11 +1093,7 @@ mod tests {
                 "[#{}] font_name must roundtrip",
                 i
             );
-            assert_eq!(
-                rep.color, orig.color,
-                "[#{}] color must roundtrip",
-                i
-            );
+            assert_eq!(rep.color, orig.color, "[#{}] color must roundtrip", i);
             assert_eq!(
                 rep.common.width, orig.common.width,
                 "[#{}] common.width must roundtrip",
@@ -492,7 +1113,46 @@ mod tests {
     }
 
     #[test]
-    fn linesegs_emitted_per_linebreak() {
+    fn linesegs_from_ir_emitted_per_linebreak() {
+        // IR 에 lineseg 가 있으면 줄 수만큼 그대로 방출. IR 에 없으면 방출 생략 (#1380)
+        // — 종전의 텍스트 `\n` 기반 fallback 합성은 제거됐다.
+        let mut doc = Document::default();
+        let mut section = crate::model::document::Section::default();
+        let mut para = crate::model::paragraph::Paragraph::default();
+        para.text = "A\nB\nC".to_string();
+        for (textpos, vertpos) in [(0u32, 0i32), (2, 1600), (4, 3200)] {
+            para.line_segs.push(crate::model::paragraph::LineSeg {
+                text_start: textpos,
+                vertical_pos: vertpos,
+                line_height: 1000,
+                text_height: 1000,
+                baseline_distance: 850,
+                line_spacing: 600,
+                tag: crate::model::paragraph::LineSeg::TAG_SINGLE_SEGMENT_LINE,
+                ..Default::default()
+            });
+        }
+        section.paragraphs.push(para);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        let mut sec0 = archive.by_name("Contents/section0.xml").expect("section0");
+        let mut xml = String::new();
+        std::io::Read::read_to_string(&mut sec0, &mut xml).expect("read");
+
+        let count = xml.matches("<hp:lineseg ").count();
+        assert_eq!(count, 3, "expected 3 linesegs, got {}: {}", count, xml);
+        assert!(xml.contains(r#"textpos="0" vertpos="0""#));
+        assert!(xml.contains(r#"textpos="2" vertpos="1600""#));
+        assert!(xml.contains(r#"textpos="4" vertpos="3200""#));
+    }
+
+    #[test]
+    fn task1380_no_linesegarray_when_ir_has_none() {
+        // 파서가 zero-default 를 주입하지 않으므로(#1380) IR 에 lineseg 없는 문단은
+        // 패키지 산출물에서도 linesegarray 가 없어야 한다 (원본 무 → RT 무 대칭).
         let mut doc = Document::default();
         let mut section = crate::model::document::Section::default();
         let mut para = crate::model::paragraph::Paragraph::default();
@@ -507,12 +1167,7 @@ mod tests {
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut sec0, &mut xml).expect("read");
 
-        // 3줄(소프트) → lineseg 3개, textpos=0/2/4, vertpos=0/1600/3200
-        let count = xml.matches("<hp:lineseg ").count();
-        assert_eq!(count, 3, "expected 3 linesegs, got {}: {}", count, xml);
-        assert!(xml.contains(r#"textpos="0" vertpos="0""#));
-        assert!(xml.contains(r#"textpos="2" vertpos="1600""#));
-        assert!(xml.contains(r#"textpos="4" vertpos="3200""#));
+        assert!(!xml.contains("<hp:linesegarray"), "got: {}", xml);
     }
 
     #[test]
@@ -577,7 +1232,8 @@ mod tests {
     #[test]
     fn hancom_required_files_present() {
         let mut doc = Document::default();
-        doc.sections.push(crate::model::document::Section::default());
+        doc.sections
+            .push(crate::model::document::Section::default());
         let bytes = serialize_hwpx(&doc).expect("serialize");
         // ZIP 파일 목록에 한컴 필수 11개가 모두 있는지 확인
         let cursor = std::io::Cursor::new(&bytes);
@@ -597,11 +1253,7 @@ mod tests {
             "META-INF/manifest.xml",
         ];
         for r in &required {
-            assert!(
-                names.iter().any(|n| n == r),
-                "missing required file: {}",
-                r
-            );
+            assert!(names.iter().any(|n| n == r), "missing required file: {}", r);
         }
     }
 
@@ -668,11 +1320,247 @@ mod tests {
         );
         drop(sec0);
 
+        // content.hpf manifest에 embedded BinData 계약이 명시되어야 한컴이 이미지를 로드한다.
+        let cursor3 = std::io::Cursor::new(&bytes);
+        let mut archive3 = zip::ZipArchive::new(cursor3).expect("zip");
+        let mut content_hpf = archive3
+            .by_name("Contents/content.hpf")
+            .expect("content.hpf");
+        let mut content_xml = String::new();
+        std::io::Read::read_to_string(&mut content_hpf, &mut content_xml).expect("read");
+        assert!(
+            content_xml.contains(r#"isEmbeded="1""#),
+            "embedded BinData manifest item must include isEmbeded=1: {}",
+            content_xml
+        );
+        drop(content_hpf);
+
         // 라운드트립: BinData 보존 확인
         let parsed = parse_hwpx(&bytes).expect("parse back");
         assert_eq!(parsed.bin_data_content.len(), 1);
         assert_eq!(parsed.bin_data_content[0].data, fake_png);
         assert_eq!(parsed.bin_data_content[0].extension, "png");
+    }
+
+    #[test]
+    fn issue1917_bindata_load_failure_preserves_pic_control() {
+        // [#1917] BinData 엔트리 로드 실패(압축 해제 상한 초과·엔트리 손상 등)
+        // 시에도 pic 컨트롤과 binaryItemIDRef 가 보존되어야 한다. 종전에는
+        // bin_data_content 미등록 → resolve_bin_id 실패 → <hp:pic> 드롭으로
+        // 왕복 구조 손실(IR_DIFF 하드 실패)이 발생했다.
+        use crate::model::bin_data::BinDataContent;
+        use crate::model::control::Control;
+        use crate::model::image::{ImageAttr, Picture};
+        use crate::model::shape::CommonObjAttr;
+
+        fn count_pics(doc: &Document) -> usize {
+            doc.sections
+                .iter()
+                .flat_map(|s| s.paragraphs.iter())
+                .flat_map(|p| p.controls.iter())
+                .filter(|c| matches!(c, Control::Picture(_)))
+                .count()
+        }
+
+        let mut doc = Document::default();
+        // 재직렬화 시 charPrIDRef=0 해소용 기본 글자모양 (parse_hwpx 산출 IR 동형)
+        doc.doc_info
+            .char_shapes
+            .push(crate::model::style::CharShape::default());
+        doc.bin_data_content.push(BinDataContent {
+            id: 1,
+            data: b"BMfake_bmp_data".to_vec(),
+            extension: "bmp".to_string(),
+        });
+        let mut section = crate::model::document::Section::default();
+        let mut para = crate::model::paragraph::Paragraph::default();
+        para.text = "A".to_string();
+        para.char_offsets = vec![8];
+        para.char_count = 10;
+        para.controls.push(Control::Picture(Box::new(Picture {
+            common: CommonObjAttr {
+                width: 5000,
+                height: 3000,
+                treat_as_char: true,
+                ..Default::default()
+            },
+            image_attr: ImageAttr {
+                bin_data_id: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        })));
+        section.paragraphs.push(para);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize picture");
+
+        // BinData 엔트리만 제거한 ZIP 재작성 — read_file_bytes 실패(Err 분기)를
+        // 유발한다. 상한 초과와 동일 분기를 실 512MB 페이로드 없이 재현.
+        let stripped = {
+            let mut archive = zip::ZipArchive::new(std::io::Cursor::new(&bytes)).expect("zip open");
+            let mut out = std::io::Cursor::new(Vec::<u8>::new());
+            let mut zw = zip::ZipWriter::new(&mut out);
+            let opts = zip::write::SimpleFileOptions::default()
+                .compression_method(zip::CompressionMethod::Deflated);
+            for i in 0..archive.len() {
+                let mut f = archive.by_index(i).expect("entry");
+                let name = f.name().to_string();
+                if name.starts_with("BinData/") {
+                    continue;
+                }
+                let mut data = Vec::new();
+                f.read_to_end(&mut data).expect("read entry");
+                zw.start_file(name, opts).expect("start_file");
+                std::io::Write::write_all(&mut zw, &data).expect("write entry");
+            }
+            zw.finish().expect("finish");
+            out.into_inner()
+        };
+
+        // 재파싱: placeholder 등록 + pic 컨트롤 보존
+        let doc2 = parse_hwpx(&stripped).expect("parse stripped");
+        assert_eq!(
+            doc2.bin_data_content.len(),
+            1,
+            "로드 실패한 BinData 도 placeholder 로 등록되어야 한다"
+        );
+        assert!(
+            doc2.bin_data_content[0].data.is_empty(),
+            "placeholder 데이터는 빈 값이어야 한다"
+        );
+        assert_eq!(
+            doc2.bin_data_content[0].extension, "bmp",
+            "placeholder 확장자는 manifest 기준으로 보존"
+        );
+        assert_eq!(count_pics(&doc2), 1, "pic 컨트롤이 보존되어야 한다");
+
+        // 재직렬화 성공(binaryItemIDRef 미등록 에러 없음) + pic 재보존
+        let bytes2 = serialize_hwpx(&doc2).expect("re-serialize with placeholder");
+        let doc3 = parse_hwpx(&bytes2).expect("parse re-serialized");
+        assert_eq!(count_pics(&doc3), 1, "재직렬화 왕복 후에도 pic 보존");
+    }
+
+    #[test]
+    fn issue1452_hwpx_preserves_alpha_png_bindata_bytes() {
+        use crate::model::bin_data::BinDataContent;
+        use crate::model::control::Control;
+        use crate::model::image::{ImageAttr, Picture};
+        use crate::model::shape::CommonObjAttr;
+
+        let alpha_png = vec![
+            0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48,
+            0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x04, 0x00, 0x00,
+            0x00, 0xb5, 0x1c, 0x0c, 0x02, 0x00, 0x00, 0x00, 0x0b, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0xda, 0x63, 0x60, 0x60, 0x00, 0x00, 0x00, 0x03, 0x00, 0x01, 0x2b, 0x09, 0x4d, 0x84,
+            0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+        ];
+
+        let mut doc = Document::default();
+        doc.bin_data_content.push(BinDataContent {
+            id: 1,
+            data: alpha_png.clone(),
+            extension: "png".to_string(),
+        });
+
+        let mut section = crate::model::document::Section::default();
+        let mut para = crate::model::paragraph::Paragraph::default();
+        para.text = "A".to_string();
+        para.char_offsets = vec![8];
+        para.char_count = 10;
+        para.controls.push(Control::Picture(Box::new(Picture {
+            common: CommonObjAttr {
+                width: 5000,
+                height: 5000,
+                treat_as_char: true,
+                ..Default::default()
+            },
+            image_attr: ImageAttr {
+                bin_data_id: 1,
+                ..Default::default()
+            },
+            ..Default::default()
+        })));
+        section.paragraphs.push(para);
+        doc.sections.push(section);
+
+        let bytes = serialize_hwpx(&doc).expect("serialize alpha png picture");
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut archive = zip::ZipArchive::new(cursor).expect("zip");
+        let bin_name = archive
+            .file_names()
+            .find(|name| name.starts_with("BinData/") && name.ends_with(".png"))
+            .map(String::from)
+            .expect("png BinData entry");
+        let mut bin = archive.by_name(&bin_name).expect("read png BinData");
+        let mut actual = Vec::new();
+        std::io::Read::read_to_end(&mut bin, &mut actual).expect("read");
+
+        assert_eq!(
+            actual, alpha_png,
+            "알파 채널이 있는 PNG BinData 바이트는 HWPX ZIP 안에서도 그대로 보존되어야 한다"
+        );
+    }
+
+    #[test]
+    fn issue_1345_picture_effects_shadow_roundtrip() {
+        use crate::model::control::Control;
+        use crate::model::shape::ShapeObject;
+
+        fn count_shape_picture_shadows(shape: &ShapeObject) -> usize {
+            match shape {
+                ShapeObject::Picture(pic) => usize::from(pic.effects.shadow.is_some()),
+                ShapeObject::Group(group) => {
+                    group.children.iter().map(count_shape_picture_shadows).sum()
+                }
+                _ => 0,
+            }
+        }
+
+        fn count_picture_shadows(control: &Control) -> usize {
+            match control {
+                Control::Picture(pic) => usize::from(pic.effects.shadow.is_some()),
+                Control::Shape(shape) => count_shape_picture_shadows(shape),
+                _ => 0,
+            }
+        }
+
+        let bytes = std::fs::read("samples/hwpx/aift.hwpx")
+            .expect("samples/hwpx/aift.hwpx must be readable");
+        let original = parse_hwpx(&bytes).expect("parse original");
+        let parsed_shadow_count: usize = original
+            .sections
+            .iter()
+            .flat_map(|section| &section.paragraphs)
+            .flat_map(|para| &para.controls)
+            .map(count_picture_shadows)
+            .sum();
+        assert!(
+            parsed_shadow_count > 0,
+            "parser must preserve at least one picture shadow effect"
+        );
+
+        let serialized = serialize_hwpx(&original).expect("serialize roundtrip");
+
+        let mut archive =
+            zip::ZipArchive::new(std::io::Cursor::new(serialized)).expect("roundtrip zip");
+        let section_names: Vec<String> = archive
+            .file_names()
+            .filter(|name| name.starts_with("Contents/section") && name.ends_with(".xml"))
+            .map(String::from)
+            .collect();
+        let mut section_xml = String::new();
+        for name in section_names {
+            let mut section = archive.by_name(&name).expect("roundtrip section");
+            std::io::Read::read_to_string(&mut section, &mut section_xml).expect("read section");
+        }
+
+        for needle in ["<hp:shadow ", "<hp:scale ", "<hp:effectsColor ", "<hp:rgb "] {
+            assert!(
+                section_xml.contains(needle),
+                "roundtrip section XML must preserve {needle}"
+            );
+        }
     }
 
     #[test]
@@ -690,8 +1578,7 @@ mod tests {
         para.text = "A".to_string();
         para.char_offsets = vec![8];
         para.char_count = 10;
-        para.controls
-            .push(Control::Table(Box::new(Table::default())));
+        para.controls.push(Control::Table(Box::default()));
         section.paragraphs.push(para);
         doc.sections.push(section);
 
@@ -735,6 +1622,8 @@ mod tests {
         para.controls.push(Control::Footnote(Box::new(Footnote {
             number: 1,
             paragraphs: vec![fn_para],
+            after_decoration_letter: 0x0029,
+            ..Default::default()
         })));
 
         let mut en_para = Paragraph::default();
@@ -742,6 +1631,8 @@ mod tests {
         para.controls.push(Control::Endnote(Box::new(Endnote {
             number: 1,
             paragraphs: vec![en_para],
+            after_decoration_letter: 0x0029,
+            ..Default::default()
         })));
 
         section.paragraphs.push(para);
@@ -754,17 +1645,13 @@ mod tests {
         let mut sec0 = archive.by_name("Contents/section0.xml").expect("section0");
         let mut xml = String::new();
         std::io::Read::read_to_string(&mut sec0, &mut xml).expect("read");
+        assert!(xml.contains("<hp:footNote"), "footNote missing: {}", xml);
+        assert!(xml.contains("<hp:endNote"), "endNote missing: {}", xml);
         assert!(
-            xml.contains("<hp:footNote"),
-            "footNote missing: {}",
+            xml.contains("각주 텍스트"),
+            "footnote text missing: {}",
             xml
         );
-        assert!(
-            xml.contains("<hp:endNote"),
-            "endNote missing: {}",
-            xml
-        );
-        assert!(xml.contains("각주 텍스트"), "footnote text missing: {}", xml);
         assert!(xml.contains("미주 텍스트"), "endnote text missing: {}", xml);
         drop(sec0);
 

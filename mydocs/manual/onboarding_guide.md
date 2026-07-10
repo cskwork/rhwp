@@ -27,7 +27,22 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 # Node.js (rhwp-studio 웹 에디터)
 # → Node.js 18+ 설치
+
+# SVG/PDF 시각 sweep 보조 도구 (교육 통합/렌더링 PR 검증용)
+# Ubuntu/WSL/Debian 기준
+sudo apt install librsvg2-bin poppler-utils
+
+# 한국어 폰트 (시각 sweep false positive 감소용)
+sudo apt install fonts-noto-cjk fonts-nanum
 ```
+
+`librsvg2-bin`은 `rsvg-convert`를 제공하고, `poppler-utils`는 `pdftoppm`과
+`pdftotext`를 제공한다. 이 세 도구는 PDF 기준 시각 sweep 자동화에 필요하다.
+`fonts-noto-cjk`와 `fonts-nanum`은 공개 한글 폰트 환경을 맞춰 SVG/PDF 비교의
+폰트 차이 후보를 줄이기 위한 권장 설치 항목이다.
+한컴/HY 계열 전용 폰트는 저장소에 포함하지 않고, 라이선스가 있는 로컬 경로를
+`--font-path`로 지정해서 사용한다.
+자세한 절차는 [PDF/SVG visual sweep 가이드](visual_sweep_guide.md)를 참고한다.
 
 ### 2.2 빌드 확인
 
@@ -84,6 +99,10 @@ npx vite --host 0.0.0.0 --port 7700
 ## 4. 디버깅 프로토콜
 
 이 프로젝트의 가장 차별화된 부분입니다. 작업지시자와 에이전트가 **동일한 언어로 문제를 지정**할 수 있는 도구 체계를 갖추고 있습니다.
+
+HWPX를 IR로 읽은 뒤 HWP로 저장하는 경로의 한컴 호환성 문제는 별도 추적법이 필요합니다.
+정답 HWP와 생성 HWP의 record 차이를 작은 probe로 나누어 한컴 출력 경계가 어디서 움직이는지 확인합니다.
+자세한 절차는 [HWPX2HWP Probe 추적 온보딩](hwpx2hwp_probe_onboarding.md)을 참고하세요.
 
 ### 4.1 3단계 디버깅 워크플로우
 

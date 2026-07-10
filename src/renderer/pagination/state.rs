@@ -1,8 +1,8 @@
 //! PaginationState: paginate_with_measured의 가변 상태를 캡슐화
 
-use std::collections::HashMap;
+use super::{ColumnContent, PageContent, PageItem, WrapAroundPara};
 use crate::renderer::page_layout::PageLayoutInfo;
-use super::{PageContent, ColumnContent, PageItem, WrapAroundPara};
+use std::collections::HashMap;
 
 /// 페이지당 방어 로직 최대 실행 횟수.
 /// 정상 문서에서는 절대 도달하지 않는 값. 이 값을 초과하면 무한 루프로 판단하고 강제 배치.
@@ -24,6 +24,7 @@ pub(super) struct PaginationState {
     pub on_first_multicolumn_page: bool,
     pub section_index: usize,
     pub footnote_separator_overhead: f64,
+    pub footnote_between_notes_margin: f64,
     pub footnote_safety_margin: f64,
     /// 현재 단에 축적된 어울림 리턴 문단 목록
     pub current_column_wrap_around_paras: Vec<WrapAroundPara>,
@@ -51,6 +52,7 @@ impl PaginationState {
         col_count: u16,
         section_index: usize,
         footnote_separator_overhead: f64,
+        footnote_between_notes_margin: f64,
         footnote_safety_margin: f64,
     ) -> Self {
         Self {
@@ -67,6 +69,7 @@ impl PaginationState {
             on_first_multicolumn_page: false,
             section_index,
             footnote_separator_overhead,
+            footnote_between_notes_margin,
             footnote_safety_margin,
             current_column_wrap_around_paras: Vec::new(),
             current_column_wrap_anchors: std::collections::HashMap::new(),
@@ -85,6 +88,8 @@ impl PaginationState {
         }
         let col_content = ColumnContent {
             column_index: self.current_column,
+            start_height: 0.0,
+            endnote_flow: false,
             items: std::mem::take(&mut self.current_items),
             zone_layout: self.current_zone_layout.clone(),
             zone_y_offset: self.current_zone_y_offset,
@@ -103,6 +108,8 @@ impl PaginationState {
     pub fn flush_column_always(&mut self) {
         let col_content = ColumnContent {
             column_index: self.current_column,
+            start_height: 0.0,
+            endnote_flow: false,
             items: std::mem::take(&mut self.current_items),
             zone_layout: self.current_zone_layout.clone(),
             zone_y_offset: self.current_zone_y_offset,
@@ -139,7 +146,10 @@ impl PaginationState {
             return;
         }
         let is_para_item = self.current_items.last().map_or(false, |item| {
-            matches!(item, PageItem::FullParagraph { .. } | PageItem::PartialParagraph { .. })
+            matches!(
+                item,
+                PageItem::FullParagraph { .. } | PageItem::PartialParagraph { .. }
+            )
         });
         if !is_para_item {
             return;
@@ -202,8 +212,41 @@ impl PaginationState {
         if self.is_first_footnote_on_page {
             self.current_footnote_height += self.footnote_separator_overhead;
             self.is_first_footnote_on_page = false;
+        } else {
+            self.current_footnote_height += self.footnote_between_notes_margin;
         }
         self.current_footnote_height += height;
+        self.sync_current_page_footnote_area();
+    }
+
+    pub fn projected_footnote_height(&self, note_content_height: f64, note_count: usize) -> f64 {
+        if note_count == 0 {
+            return self.current_footnote_height;
+        }
+        let separator = if self.is_first_footnote_on_page {
+            self.footnote_separator_overhead
+        } else {
+            0.0
+        };
+        let between_count = if self.is_first_footnote_on_page {
+            note_count.saturating_sub(1)
+        } else {
+            note_count
+        };
+        self.current_footnote_height
+            + separator
+            + self.footnote_between_notes_margin * between_count as f64
+            + note_content_height
+    }
+
+    fn sync_current_page_footnote_area(&mut self) {
+        if self.current_footnote_height <= 0.0 {
+            return;
+        }
+        if let Some(page) = self.pages.last_mut() {
+            page.layout
+                .update_footnote_area(self.current_footnote_height);
+        }
     }
 
     /// 새 페이지 push + 상태 리셋

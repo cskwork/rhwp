@@ -21,7 +21,7 @@ fn issue_598_body_footnote_marker_has_hit_and_cursor_unit() {
     assert_eq!(doc.get_control_text_positions(0, 3), "[7]");
 
     let hit = doc
-        .hit_test_body_footnote_marker_native(0, 264.0, 380.0)
+        .hit_test_body_footnote_marker_native(0, 264.0, 392.0)
         .expect("hit body footnote marker");
     assert!(hit.contains("\"hit\":true"), "hit json: {hit}");
     assert!(hit.contains("\"sectionIndex\":0"), "hit json: {hit}");
@@ -57,7 +57,7 @@ fn issue_598_second_body_footnote_marker_has_same_cursor_unit() {
     assert_eq!(doc.get_control_text_positions(0, 7), "[6]");
 
     let hit = doc
-        .hit_test_body_footnote_marker_native(0, 214.0, 670.0)
+        .hit_test_body_footnote_marker_native(0, 214.0, 684.0)
         .expect("hit second body footnote marker");
     assert!(hit.contains("\"hit\":true"), "hit json: {hit}");
     assert!(hit.contains("\"paragraphIndex\":7"), "hit json: {hit}");
@@ -164,7 +164,8 @@ fn issue_598_backspace_before_marker_keeps_marker_anchor_and_undo_restores_it() 
 
     assert_eq!(doc.get_control_text_positions(0, 3), "[7]");
     assert_eq!(
-        doc.get_text_range_native(0, 3, 6, 2).expect("text around marker"),
+        doc.get_text_range_native(0, 3, 6, 2)
+            .expect("text around marker"),
         "체와"
     );
 
@@ -176,7 +177,8 @@ fn issue_598_backspace_before_marker_keeps_marker_anchor_and_undo_restores_it() 
         "footnote marker should stay between remaining previous text and following text"
     );
     assert_eq!(
-        doc.get_text_range_native(0, 3, 5, 2).expect("text around marker after delete"),
+        doc.get_text_range_native(0, 3, 5, 2)
+            .expect("text around marker after delete"),
         "액와"
     );
 
@@ -188,7 +190,8 @@ fn issue_598_backspace_before_marker_keeps_marker_anchor_and_undo_restores_it() 
         "undo-like insert should restore original footnote marker anchor"
     );
     assert_eq!(
-        doc.get_text_range_native(0, 3, 6, 2).expect("text around marker after restore"),
+        doc.get_text_range_native(0, 3, 6, 2)
+            .expect("text around marker after restore"),
         "체와"
     );
 }

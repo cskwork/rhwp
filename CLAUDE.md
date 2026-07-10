@@ -223,6 +223,22 @@ rhwp ir-diff sample.hwpx sample.hwp --max-lines 50      # 출력 50줄 제한
 
 상세 매뉴얼: `mydocs/manual/ir_diff_command.md`
 
+### HWPX roundtrip 검증 (`hwpx-roundtrip`)
+
+HWPX 파일을 parse→serialize→재parse 하여 IR 뼈대 보존 + 패키지(ZIP) 구조 + 2-round 안정성을 검사한다.
+
+```bash
+rhwp hwpx-roundtrip sample.hwpx                                  # 단일 파일 검사
+rhwp hwpx-roundtrip --batch samples/hwpx                         # 폴더 전수 (재귀)
+rhwp hwpx-roundtrip --batch samples/hwpx -o output/poc/task1315  # inventory.tsv + *.rt.hwpx 산출
+```
+
+하드 실패 존재 시 종료 코드 1. `samples/hwpx/` 전수 회귀 게이트는 `cargo test --test hwpx_roundtrip_baseline` (신규 샘플 자동 포함, xfail/제외 등급은 테스트 파일의 상수 참조).
+
+> 주의: baseline 통과 = 구조(뼈대) 보존이며 시각 충실도 보장이 아니다.
+
+상세 매뉴얼: `mydocs/manual/hwpx_roundtrip_baseline.md`
+
 ### 디버깅 워크플로우
 
 레이아웃/간격 버그 디버깅 시 다음 순서로 진행한다:
@@ -290,6 +306,7 @@ HWPX↔HWP 불일치 디버깅 시 추가 단계:
 | `output/re/` | 재현검증용 샘플 (`re_sample_gen.rs` 테스트 자동 생성) |
 | `output/svg/` | SVG 내보내기 기본 출력 (`rhwp export-svg`) |
 | `output/debug/` | 디버그 오버레이 HTML (`rhwp export-svg --debug-overlay`) |
+| `output/poc/` | POC, 작업지시자 시각 판정, HWPX→HWP inventory/probe 산출물 |
 
 ### E2E 테스트
 
@@ -322,23 +339,23 @@ node e2e/text-flow.test.mjs --mode=host
 코드와 대화에서 혼동을 방지하기 위해, 아래 명칭을 통일하여 사용한다.
 
 ```
-┌─────────────────────────────────────────────────┐
-│  메뉴바 (#menu-bar)                              │
-│  파일 | 편집 | 보기 | 입력 | 서식 | 쪽 | 표      │
-├─────────────────────────────────────────────────┤
-│  도구 상자 (#icon-toolbar)                        │
-│  [오려두기][복사][붙이기] | [글자모양][문단모양] | … │
-├─────────────────────────────────────────────────┤
-│  서식 도구 모음 (#style-bar)                      │
-│  [스타일▼][글꼴▼][크기] | 가가간가 | ◀ ≡ ▶ ≡≡ | ⇕  │
-├─────────────────────────────────────────────────┤
-│                                                 │
-│  편집 영역 (#scroll-container)                    │
-│                                                 │
-├─────────────────────────────────────────────────┤
-│  상태 표시줄 (#status-bar)                        │
-│  1/1쪽 | 구역:1/1 | 삽입 |           100% [−][+] │
-└─────────────────────────────────────────────────┘
+┌───────────────────────────────────────────────────────┐
+│  메뉴바 (#menu-bar)                                   │
+│  파일 | 편집 | 보기 | 입력 | 서식 | 쪽 | 표           │
+├───────────────────────────────────────────────────────┤
+│  도구 상자 (#icon-toolbar)                            │
+│  [오려두기][복사][붙이기] | [글자모양][문단모양] | …  │
+├───────────────────────────────────────────────────────┤
+│  서식 도구 모음 (#style-bar)                          │
+│  [스타일▼][글꼴▼][크기] | 가가간가 | ◀ ≡ ▶ ≡≡ | ⇕     │
+├───────────────────────────────────────────────────────┤
+│                                                       │
+│  편집 영역 (#scroll-container)                        │
+│                                                       │
+├───────────────────────────────────────────────────────┤
+│  상태 표시줄 (#status-bar)                            │
+│  1/1쪽 | 구역:1/1 | 삽입 |          100% [−][+]       │
+└───────────────────────────────────────────────────────┘
 ```
 
 | 한국어 명칭 | HTML id/class | 설명 |
@@ -448,3 +465,7 @@ gh pr create --repo edwardkim/rhwp --base devel --head {contributor}:feature/my-
 ### 작업 규칙
 
 - 작업 시간의 시작과 종료는 작업지시자가 결정한다. 클로드가 임의로 작업 종료를 제안하거나 시간을 한정하지 않는다.
+- 기능 변경과 포맷 변경은 같은 커밋에 섞지 않는다.
+- 전체 `cargo fmt --all`은 포맷 전용 이슈/브랜치에서만 실행한다.
+- 기능/조사 브랜치에서는 새로 만들거나 직접 수정한 파일만 필요한 범위에서 정리하고, 무관한 rustfmt diff를 만들지 않는다.
+- Rust formatter 기준은 저장소 루트의 `rust-toolchain.toml`과 `rustfmt.toml`을 따른다.

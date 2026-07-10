@@ -32,6 +32,10 @@ export interface SaveDocumentOptions {
   suggestedName: string;
   currentHandle: FileSystemFileHandleLike | null;
   windowLike: FileSystemWindowLike;
+  /** [Task #833] true 시 currentHandle 무시 + 항상 showSaveFilePicker 호출 (다른 이름으로 저장). */
+  forceSaveAs?: boolean;
+  /** [#1613] 저장 picker 형식 — true 면 HWPX(.hwpx), false/미지정이면 HWP(.hwp). */
+  saveAsHwpx?: boolean;
 }
 
 export interface SaveDocumentResult {
@@ -40,13 +44,37 @@ export interface SaveDocumentResult {
   fileName: string;
 }
 
-const HWP_PICKER_TYPES = [{
+export const HWP_DOCUMENT_ACCEPT: Record<string, string[]> = {
+  'application/x-hwp': ['.hwp'],
+  'application/hwp+zip': ['.hwpx'],
+};
+
+const HWP_OPEN_PICKER_TYPES = [{
+  description: 'HWP/HWPX 문서',
+  accept: HWP_DOCUMENT_ACCEPT,
+}];
+
+const HWP_SAVE_PICKER_TYPES = [{
   description: 'HWP 문서',
-  accept: { 'application/x-hwp': ['.hwp', '.hwpx'] },
+  accept: { 'application/x-hwp': ['.hwp'] },
+}];
+
+// [#1613] HWPX 저장 picker 형식 — 저장 대화창에 "HWPX 문서 (.hwpx)" 로 표시한다.
+const HWPX_SAVE_PICKER_TYPES = [{
+  description: 'HWPX 문서',
+  accept: { 'application/hwp+zip': ['.hwpx'] },
 }];
 
 function isAbortError(error: unknown): boolean {
   return error instanceof DOMException && error.name === 'AbortError';
+}
+
+export function isSupportedDocumentFileName(fileName: string): boolean {
+  return /\.(hwp|hwpx)$/i.test(fileName.trim());
+}
+
+export function canUseOpenFilePicker(windowLike: FileSystemWindowLike): boolean {
+  return typeof windowLike.showOpenFilePicker === 'function';
 }
 
 async function writeBlobToHandle(handle: FileSystemFileHandleLike, blob: Blob): Promise<void> {
@@ -56,13 +84,13 @@ async function writeBlobToHandle(handle: FileSystemFileHandleLike, blob: Blob): 
 }
 
 export async function pickOpenFileHandle(windowLike: FileSystemWindowLike): Promise<FileSystemFileHandleLike | null> {
-  if (!windowLike.showOpenFilePicker) return null;
+  if (!canUseOpenFilePicker(windowLike)) return null;
 
   try {
-    const handles = await windowLike.showOpenFilePicker({
+    const handles = await windowLike.showOpenFilePicker!({
       excludeAcceptAllOption: true,
       multiple: false,
-      types: HWP_PICKER_TYPES,
+      types: HWP_OPEN_PICKER_TYPES,
     });
     return handles[0] ?? null;
   } catch (error) {
@@ -80,9 +108,13 @@ export async function readFileFromHandle(handle: FileSystemFileHandleLike): Prom
 }
 
 export async function saveDocumentToFileSystem(options: SaveDocumentOptions): Promise<SaveDocumentResult> {
-  const { blob, suggestedName, currentHandle, windowLike } = options;
+  const { blob, suggestedName, currentHandle, windowLike, forceSaveAs, saveAsHwpx } = options;
 
-  if (currentHandle) {
+  // [#1613] 저장 picker 형식을 출력 포맷에 맞춘다 (HWPX → "HWPX 문서(.hwpx)").
+  const pickerTypes = saveAsHwpx ? HWPX_SAVE_PICKER_TYPES : HWP_SAVE_PICKER_TYPES;
+
+  // [Task #833] forceSaveAs 시 currentHandle 우회 → 항상 picker (다른 이름으로 저장).
+  if (currentHandle && !forceSaveAs) {
     await writeBlobToHandle(currentHandle, blob);
     return {
       method: 'current-handle',
@@ -94,7 +126,7 @@ export async function saveDocumentToFileSystem(options: SaveDocumentOptions): Pr
   if (windowLike.showSaveFilePicker) {
     const handle = await windowLike.showSaveFilePicker({
       suggestedName,
-      types: HWP_PICKER_TYPES,
+      types: pickerTypes,
     });
     await writeBlobToHandle(handle, blob);
     return {

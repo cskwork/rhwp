@@ -18,6 +18,7 @@
  */
 
 import type { ValidationReport } from '../core/wasm-bridge';
+import { enableDialogDrag } from './dialog-drag';
 
 /** 모달이 반환하는 사용자 선택. */
 export type ValidationChoice = 'auto-fix' | 'as-is' | 'cancel';
@@ -66,6 +67,7 @@ export class ValidationModal {
     closeBtn.addEventListener('click', () => this.resolve('cancel'));
     title.appendChild(closeBtn);
     dialog.appendChild(title);
+    enableDialogDrag(dialog, title);
 
     // 본문
     const body = document.createElement('div');
@@ -83,7 +85,7 @@ export class ValidationModal {
     summary.style.margin = '0 0 12px 16px';
     summary.style.padding = '0';
     summary.style.fontSize = '13px';
-    summary.style.color = '#555';
+    summary.style.color = 'var(--color-text-secondary)';
     for (const [kind, cnt] of Object.entries(this.report.summary)) {
       const li = document.createElement('li');
       li.textContent = `${kind}: ${cnt}건`;
@@ -98,7 +100,7 @@ export class ValidationModal {
     summaryEl.textContent = '상세 보기';
     summaryEl.style.cursor = 'pointer';
     summaryEl.style.fontSize = '13px';
-    summaryEl.style.color = '#0066cc';
+    summaryEl.style.color = 'var(--ui-link)';
     details.appendChild(summaryEl);
 
     const detailList = document.createElement('div');
@@ -106,10 +108,11 @@ export class ValidationModal {
     detailList.style.overflow = 'auto';
     detailList.style.marginTop = '8px';
     detailList.style.padding = '8px';
-    detailList.style.background = '#f6f6f6';
+    detailList.style.background = 'var(--color-surface-raised)';
     detailList.style.borderRadius = '4px';
     detailList.style.fontFamily = 'monospace';
     detailList.style.fontSize = '12px';
+    detailList.style.color = 'var(--color-text)';
 
     const maxShow = 50;
     const shown = this.report.warnings.slice(0, maxShow);
@@ -123,7 +126,7 @@ export class ValidationModal {
     }
     if (this.report.warnings.length > maxShow) {
       const more = document.createElement('div');
-      more.style.color = '#888';
+      more.style.color = 'var(--color-text-hint)';
       more.style.marginTop = '4px';
       more.textContent = `... 외 ${this.report.warnings.length - maxShow}건`;
       detailList.appendChild(more);
@@ -152,11 +155,6 @@ export class ValidationModal {
     dialog.appendChild(footer);
 
     this.overlay.appendChild(dialog);
-
-    // 오버레이 배경 클릭은 취소로 처리 (명시적 선택 유도하려면 막을 수도 있음)
-    this.overlay.addEventListener('click', (e) => {
-      if (e.target === this.overlay) this.resolve('cancel');
-    });
   }
 
   private bindKeyboard(): void {

@@ -1,14 +1,15 @@
+use super::super::page_layout::PageLayoutInfo;
+use super::super::pagination::{ColumnContent, PageContent, PageItem};
+use super::text_measurement::estimate_text_width;
+use super::utils::{expand_numbering_format, numbering_format_to_number_format};
 use super::*;
-use crate::model::paragraph::{Paragraph, LineSeg, CharShapeRef};
-use crate::model::page::{PageDef, ColumnDef};
+use crate::model::page::{ColumnDef, PageDef};
+use crate::model::paragraph::{CharShapeRef, LineSeg, Paragraph};
+use crate::model::shape::RectangleShape;
 use crate::model::style::{Numbering, NumberingHead};
 use crate::renderer::composer::compose_paragraph;
 use crate::renderer::style_resolver::ResolvedStyleSet;
-use super::super::pagination::{PageContent, ColumnContent, PageItem};
-use super::super::page_layout::PageLayoutInfo;
-use super::utils::{expand_numbering_format, numbering_format_to_number_format};
-use super::text_measurement::estimate_text_width;
-use crate::renderer::{TextStyle, TabStop};
+use crate::renderer::{TabStop, TextStyle};
 
 fn a4_page_def() -> PageDef {
     PageDef {
@@ -58,10 +59,7 @@ fn page_def_with_body_height(height: u32) -> PageDef {
 #[test]
 fn test_build_empty_page() {
     let engine = LayoutEngine::with_default_dpi();
-    let layout = PageLayoutInfo::from_page_def_default(
-        &a4_page_def(),
-        &ColumnDef::default(),
-    );
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
     let page_content = PageContent {
         page_index: 0,
         page_number: 0,
@@ -70,23 +68,69 @@ fn test_build_empty_page() {
         column_contents: Vec::new(),
         active_header: None,
         active_footer: None,
-        page_number_pos: None, page_hide: None,
+        page_number_pos: None,
+        page_hide: None,
         footnotes: Vec::new(),
-        active_master_page: None, extra_master_pages: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
     };
     let styles = ResolvedStyleSet::default();
-    let tree = engine.build_render_tree(&page_content, &[], &[], &[], &[], &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &[],
+        &[],
+        &[],
+        &[],
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
     // 페이지 노드 + 배경 + 머리말 + 본문 + 각주 + 꼬리말
     assert!(tree.root.children.len() >= 4);
 }
 
 #[test]
+fn compact_endnote_tail_log_tolerance_allows_line_box_bleed_only() {
+    let col_bottom = 1092.3;
+
+    assert!(is_tolerated_endnote_column_bottom_bleed(
+        true,
+        col_bottom + 43.3,
+        col_bottom
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed(
+        true,
+        col_bottom + 49.0,
+        col_bottom
+    ));
+    assert!(is_tolerated_endnote_column_bottom_bleed_with_limit(
+        true,
+        col_bottom + 64.0,
+        col_bottom,
+        ENDNOTE_EQUATION_TAIL_LINE_BOX_OVERFLOW_LOG_TOLERANCE_PX,
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed_with_limit(
+        true,
+        col_bottom + 69.0,
+        col_bottom,
+        ENDNOTE_EQUATION_TAIL_LINE_BOX_OVERFLOW_LOG_TOLERANCE_PX,
+    ));
+    assert!(!is_tolerated_endnote_column_bottom_bleed(
+        false,
+        col_bottom + 1.0,
+        col_bottom
+    ));
+}
+
+#[test]
 fn test_build_page_with_paragraph() {
     let engine = LayoutEngine::with_default_dpi();
-    let layout = PageLayoutInfo::from_page_def_default(
-        &a4_page_def(),
-        &ColumnDef::default(),
-    );
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
 
     let paragraphs = vec![Paragraph {
         text: "안녕하세요".to_string(),
@@ -108,6 +152,8 @@ fn test_build_page_with_paragraph() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![PageItem::FullParagraph { para_index: 0 }],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -117,20 +163,110 @@ fn test_build_page_with_paragraph() {
         }],
         active_header: None,
         active_footer: None,
-        page_number_pos: None, page_hide: None,
+        page_number_pos: None,
+        page_hide: None,
         footnotes: Vec::new(),
-        active_master_page: None, extra_master_pages: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
     };
 
-    let tree = engine.build_render_tree(&page_content, &paragraphs, &paragraphs, &paragraphs, &composed, &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
     assert!(tree.needs_render());
 
     // Body 노드 찾기
-    let body = tree.root.children.iter().find(|n| matches!(n.node_type, RenderNodeType::Body { .. }));
+    let body = tree
+        .root
+        .children
+        .iter()
+        .find(|n| matches!(n.node_type, RenderNodeType::Body { .. }));
     assert!(body.is_some());
     let body = body.unwrap();
     // Column 노드가 있어야 함
     assert!(!body.children.is_empty());
+}
+
+/// [Issue #1945] PartialParagraph 의 start_line 이 조판 라인 수를 넘어도
+/// 패닉하지 않아야 한다 (실문서 크래시 — paragraph_layout.rs 슬라이스 범위 밖).
+/// 수정 전에는 `composed.lines[start_line..end]` 직접 인덱싱이
+/// "range start index N out of range" 로 패닉했다.
+#[test]
+fn partial_paragraph_start_line_beyond_lines_does_not_panic() {
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+
+    // 조판 라인 1개짜리 문단.
+    let paragraphs = vec![Paragraph {
+        text: "한 줄".to_string(),
+        line_segs: vec![LineSeg {
+            line_height: 400,
+            baseline_distance: 320,
+            ..Default::default()
+        }],
+        ..Default::default()
+    }];
+    let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
+    let styles = ResolvedStyleSet::default();
+
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 0,
+        section_index: 0,
+        layout,
+        column_contents: vec![ColumnContent {
+            column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
+            // start_line(5) > 조판 라인 수(1) — 이월 오버슛 재현.
+            items: vec![PageItem::PartialParagraph {
+                para_index: 0,
+                start_line: 5,
+                end_line: 6,
+            }],
+            zone_layout: None,
+            zone_y_offset: 0.0,
+            wrap_around_paras: Vec::new(),
+            used_height: 0.0,
+            wrap_anchors: std::collections::HashMap::new(),
+        }],
+        active_header: None,
+        active_footer: None,
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+    };
+
+    // 패닉 없이 반환하면 성공 (범위 밖 조각은 빈 렌더).
+    let _tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
 }
 
 #[test]
@@ -198,18 +334,21 @@ fn test_layout_with_composed_styles() {
     use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let engine = LayoutEngine::with_default_dpi();
-    let layout = PageLayoutInfo::from_page_def_default(
-        &a4_page_def(),
-        &ColumnDef::default(),
-    );
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
 
     let paragraphs = vec![Paragraph {
         text: "AAABBB".to_string(),
         char_offsets: vec![0, 1, 2, 3, 4, 5],
         char_count: 7,
         char_shapes: vec![
-            CharShapeRef { start_pos: 0, char_shape_id: 0 },
-            CharShapeRef { start_pos: 3, char_shape_id: 1 },
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 0,
+            },
+            CharShapeRef {
+                start_pos: 3,
+                char_shape_id: 1,
+            },
         ],
         line_segs: vec![LineSeg {
             line_height: 800,
@@ -250,6 +389,8 @@ fn test_layout_with_composed_styles() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![PageItem::FullParagraph { para_index: 0 }],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -259,15 +400,34 @@ fn test_layout_with_composed_styles() {
         }],
         active_header: None,
         active_footer: None,
-        page_number_pos: None, page_hide: None,
+        page_number_pos: None,
+        page_hide: None,
         footnotes: Vec::new(),
-        active_master_page: None, extra_master_pages: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
     };
 
-    let tree = engine.build_render_tree(&page_content, &paragraphs, &paragraphs, &paragraphs, &composed, &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
 
     // Body > Column > TextLine 찾기
-    let body = tree.root.children.iter()
+    let body = tree
+        .root
+        .children
+        .iter()
         .find(|n| matches!(n.node_type, RenderNodeType::Body { .. }))
         .unwrap();
     let col = &body.children[0];
@@ -306,18 +466,21 @@ fn test_layout_multi_run_x_position() {
     use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let engine = LayoutEngine::with_default_dpi();
-    let layout = PageLayoutInfo::from_page_def_default(
-        &a4_page_def(),
-        &ColumnDef::default(),
-    );
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
 
     let paragraphs = vec![Paragraph {
         text: "AB가나".to_string(),
         char_offsets: vec![0, 1, 2, 3],
         char_count: 5,
         char_shapes: vec![
-            CharShapeRef { start_pos: 0, char_shape_id: 0 },
-            CharShapeRef { start_pos: 2, char_shape_id: 1 },
+            CharShapeRef {
+                start_pos: 0,
+                char_shape_id: 0,
+            },
+            CharShapeRef {
+                start_pos: 2,
+                char_shape_id: 1,
+            },
         ],
         line_segs: vec![LineSeg {
             line_height: 400,
@@ -330,8 +493,14 @@ fn test_layout_multi_run_x_position() {
     let composed: Vec<_> = paragraphs.iter().map(|p| compose_paragraph(p)).collect();
     let styles = ResolvedStyleSet {
         char_styles: vec![
-            ResolvedCharStyle { font_size: 16.0, ..Default::default() },
-            ResolvedCharStyle { font_size: 16.0, ..Default::default() },
+            ResolvedCharStyle {
+                font_size: 16.0,
+                ..Default::default()
+            },
+            ResolvedCharStyle {
+                font_size: 16.0,
+                ..Default::default()
+            },
         ],
         para_styles: Vec::new(),
         border_styles: Vec::new(),
@@ -346,6 +515,8 @@ fn test_layout_multi_run_x_position() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![PageItem::FullParagraph { para_index: 0 }],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -355,14 +526,33 @@ fn test_layout_multi_run_x_position() {
         }],
         active_header: None,
         active_footer: None,
-        page_number_pos: None, page_hide: None,
+        page_number_pos: None,
+        page_hide: None,
         footnotes: Vec::new(),
-        active_master_page: None, extra_master_pages: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
     };
 
-    let tree = engine.build_render_tree(&page_content, &paragraphs, &paragraphs, &paragraphs, &composed, &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
 
-    let body = tree.root.children.iter()
+    let body = tree
+        .root
+        .children
+        .iter()
         .find(|n| matches!(n.node_type, RenderNodeType::Body { .. }))
         .unwrap();
     let col = &body.children[0];
@@ -379,8 +569,8 @@ fn test_layout_multi_run_x_position() {
 
 #[test]
 fn test_resolved_to_text_style() {
-    use crate::renderer::style_resolver::ResolvedCharStyle;
     use crate::model::style::UnderlineType;
+    use crate::renderer::style_resolver::ResolvedCharStyle;
 
     let styles = ResolvedStyleSet {
         char_styles: vec![ResolvedCharStyle {
@@ -442,7 +632,10 @@ fn test_resolved_to_text_style_missing_id() {
 
 #[test]
 fn test_estimate_text_width() {
-    let style = TextStyle { font_size: 16.0, ..Default::default() };
+    let style = TextStyle {
+        font_size: 16.0,
+        ..Default::default()
+    };
 
     // Latin characters: 0.5 * font_size each
     let w = estimate_text_width("AB", &style);
@@ -460,19 +653,31 @@ fn test_estimate_text_width() {
 #[test]
 fn test_estimate_text_width_with_ratio() {
     // 장평 80%: 기본 폭의 80%
-    let style = TextStyle { font_size: 16.0, ratio: 0.8, ..Default::default() };
+    let style = TextStyle {
+        font_size: 16.0,
+        ratio: 0.8,
+        ..Default::default()
+    };
     let w = estimate_text_width("가나", &style);
     // base: 2 * 16.0 = 32.0, * 0.8 = 25.6 → round = 26.0
     assert!((w - 26.0).abs() < 0.01);
 
     // 장평 150%
-    let style = TextStyle { font_size: 16.0, ratio: 1.5, ..Default::default() };
+    let style = TextStyle {
+        font_size: 16.0,
+        ratio: 1.5,
+        ..Default::default()
+    };
     let w = estimate_text_width("AB", &style);
     // base: 2 * 8.0 = 16.0, * 1.5 = 24.0
     assert!((w - 24.0).abs() < 0.01);
 
     // 장평 100%: 기존과 동일
-    let style = TextStyle { font_size: 16.0, ratio: 1.0, ..Default::default() };
+    let style = TextStyle {
+        font_size: 16.0,
+        ratio: 1.0,
+        ..Default::default()
+    };
     let w = estimate_text_width("가나", &style);
     assert!((w - 32.0).abs() < 0.01);
 }
@@ -527,7 +732,10 @@ fn test_estimate_text_width_with_extra_spacing() {
 #[test]
 fn test_extra_spacing_zero_default() {
     // 기본값(0.0)에서는 기존 동작과 동일
-    let style = TextStyle { font_size: 16.0, ..Default::default() };
+    let style = TextStyle {
+        font_size: 16.0,
+        ..Default::default()
+    };
     let w_no_extra = estimate_text_width("가나다", &style);
     let positions_no_extra = compute_char_positions("가나다", &style);
 
@@ -549,7 +757,10 @@ fn test_extra_spacing_zero_default() {
 #[test]
 fn test_extra_word_spacing_no_effect_on_non_space() {
     // 공백 없는 텍스트에서 extra_word_spacing은 영향 없음
-    let style_base = TextStyle { font_size: 16.0, ..Default::default() };
+    let style_base = TextStyle {
+        font_size: 16.0,
+        ..Default::default()
+    };
     let style_extra = TextStyle {
         font_size: 16.0,
         extra_word_spacing: 100.0,
@@ -577,15 +788,12 @@ fn test_tab_not_affected_by_extra_spacing() {
 
 #[test]
 fn test_layout_table_basic() {
-    use crate::model::table::{Table, Cell};
     use crate::model::control::Control;
+    use crate::model::table::{Cell, Table};
     use crate::renderer::style_resolver::ResolvedBorderStyle;
 
     let engine = LayoutEngine::with_default_dpi();
-    let layout = PageLayoutInfo::from_page_def_default(
-        &a4_page_def(),
-        &ColumnDef::default(),
-    );
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
 
     // 2x2 표가 있는 문단 (각 셀에 border_fill_id=1 설정)
     let table = Table {
@@ -594,27 +802,59 @@ fn test_layout_table_basic() {
         row_sizes: vec![2, 2], // 행별 셀 수
         cells: vec![
             Cell {
-                col: 0, row: 0, col_span: 1, row_span: 1,
-                width: 3000, height: 1200, border_fill_id: 1,
-                paragraphs: vec![Paragraph { text: "A".to_string(), ..Default::default() }],
+                col: 0,
+                row: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 3000,
+                height: 1200,
+                border_fill_id: 1,
+                paragraphs: vec![Paragraph {
+                    text: "A".to_string(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             Cell {
-                col: 1, row: 0, col_span: 1, row_span: 1,
-                width: 3000, height: 1200, border_fill_id: 1,
-                paragraphs: vec![Paragraph { text: "B".to_string(), ..Default::default() }],
+                col: 1,
+                row: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 3000,
+                height: 1200,
+                border_fill_id: 1,
+                paragraphs: vec![Paragraph {
+                    text: "B".to_string(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             Cell {
-                col: 0, row: 1, col_span: 1, row_span: 1,
-                width: 3000, height: 1200, border_fill_id: 1,
-                paragraphs: vec![Paragraph { text: "C".to_string(), ..Default::default() }],
+                col: 0,
+                row: 1,
+                col_span: 1,
+                row_span: 1,
+                width: 3000,
+                height: 1200,
+                border_fill_id: 1,
+                paragraphs: vec![Paragraph {
+                    text: "C".to_string(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
             Cell {
-                col: 1, row: 1, col_span: 1, row_span: 1,
-                width: 3000, height: 1200, border_fill_id: 1,
-                paragraphs: vec![Paragraph { text: "D".to_string(), ..Default::default() }],
+                col: 1,
+                row: 1,
+                col_span: 1,
+                row_span: 1,
+                width: 3000,
+                height: 1200,
+                border_fill_id: 1,
+                paragraphs: vec![Paragraph {
+                    text: "D".to_string(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
         ],
@@ -624,7 +864,10 @@ fn test_layout_table_basic() {
     let paragraphs = vec![Paragraph {
         text: String::new(),
         controls: vec![Control::Table(Box::new(table))],
-        line_segs: vec![LineSeg { line_height: 400, ..Default::default() }],
+        line_segs: vec![LineSeg {
+            line_height: 400,
+            ..Default::default()
+        }],
         ..Default::default()
     }];
 
@@ -642,9 +885,14 @@ fn test_layout_table_basic() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![
                 PageItem::FullParagraph { para_index: 0 },
-                PageItem::Table { para_index: 0, control_index: 0 },
+                PageItem::Table {
+                    para_index: 0,
+                    control_index: 0,
+                },
             ],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -654,25 +902,48 @@ fn test_layout_table_basic() {
         }],
         active_header: None,
         active_footer: None,
-        page_number_pos: None, page_hide: None,
+        page_number_pos: None,
+        page_hide: None,
         footnotes: Vec::new(),
-        active_master_page: None, extra_master_pages: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
     };
 
-    let tree = engine.build_render_tree(&page_content, &paragraphs, &paragraphs, &paragraphs, &composed, &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
 
     // Body > Column 내에 Table 노드가 있어야 함
-    let body = tree.root.children.iter()
+    let body = tree
+        .root
+        .children
+        .iter()
         .find(|n| matches!(n.node_type, RenderNodeType::Body { .. }))
         .unwrap();
     let col = &body.children[0];
 
-    let table_node = col.children.iter()
+    let table_node = col
+        .children
+        .iter()
         .find(|n| matches!(n.node_type, RenderNodeType::Table(_)))
         .expect("Table node should exist");
 
     // 4개 셀 + 엣지 기반 테두리 Line 노드들
-    let cell_count = table_node.children.iter()
+    let cell_count = table_node
+        .children
+        .iter()
         .filter(|c| matches!(c.node_type, RenderNodeType::TableCell(_)))
         .count();
     assert_eq!(cell_count, 4);
@@ -680,32 +951,67 @@ fn test_layout_table_basic() {
     // 엣지 기반 테두리: 표 노드의 직접 자식으로 Line 노드가 있어야 함
     // 2x2 표: 수평 3줄 + 수직 3줄 = 6개 이상의 Line 노드
     // (기본 Solid 테두리이므로 이중선/삼중선이 아니면 각 엣지당 1개)
-    let table_line_count = table_node.children.iter()
+    let table_line_count = table_node
+        .children
+        .iter()
         .filter(|c| matches!(c.node_type, RenderNodeType::Line(_)))
         .count();
-    assert!(table_line_count >= 6, "표에 6개 이상의 엣지 테두리가 있어야 함 (실제: {})", table_line_count);
+    assert!(
+        table_line_count >= 6,
+        "표에 6개 이상의 엣지 테두리가 있어야 함 (실제: {})",
+        table_line_count
+    );
 }
 
 #[test]
 fn test_layout_table_cell_positions() {
-    use crate::model::table::{Table, Cell};
     use crate::model::control::Control;
+    use crate::model::table::{Cell, Table};
 
     let engine = LayoutEngine::with_default_dpi();
-    let layout = PageLayoutInfo::from_page_def_default(
-        &a4_page_def(),
-        &ColumnDef::default(),
-    );
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
 
     let table = Table {
         row_count: 2,
         col_count: 2,
         row_sizes: vec![2, 2], // 행별 셀 수
         cells: vec![
-            Cell { col: 0, row: 0, col_span: 1, row_span: 1, width: 3600, height: 720, ..Default::default() },
-            Cell { col: 1, row: 0, col_span: 1, row_span: 1, width: 3600, height: 720, ..Default::default() },
-            Cell { col: 0, row: 1, col_span: 1, row_span: 1, width: 3600, height: 720, ..Default::default() },
-            Cell { col: 1, row: 1, col_span: 1, row_span: 1, width: 3600, height: 720, ..Default::default() },
+            Cell {
+                col: 0,
+                row: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 3600,
+                height: 720,
+                ..Default::default()
+            },
+            Cell {
+                col: 1,
+                row: 0,
+                col_span: 1,
+                row_span: 1,
+                width: 3600,
+                height: 720,
+                ..Default::default()
+            },
+            Cell {
+                col: 0,
+                row: 1,
+                col_span: 1,
+                row_span: 1,
+                width: 3600,
+                height: 720,
+                ..Default::default()
+            },
+            Cell {
+                col: 1,
+                row: 1,
+                col_span: 1,
+                row_span: 1,
+                width: 3600,
+                height: 720,
+                ..Default::default()
+            },
         ],
         ..Default::default()
     };
@@ -713,7 +1019,10 @@ fn test_layout_table_cell_positions() {
     let paragraphs = vec![Paragraph {
         text: String::new(),
         controls: vec![Control::Table(Box::new(table))],
-        line_segs: vec![LineSeg { line_height: 400, ..Default::default() }],
+        line_segs: vec![LineSeg {
+            line_height: 400,
+            ..Default::default()
+        }],
         ..Default::default()
     }];
 
@@ -727,9 +1036,14 @@ fn test_layout_table_cell_positions() {
         layout,
         column_contents: vec![ColumnContent {
             column_index: 0,
+            start_height: 0.0,
+            endnote_flow: false,
             items: vec![
                 PageItem::FullParagraph { para_index: 0 },
-                PageItem::Table { para_index: 0, control_index: 0 },
+                PageItem::Table {
+                    para_index: 0,
+                    control_index: 0,
+                },
             ],
             zone_layout: None,
             zone_y_offset: 0.0,
@@ -739,18 +1053,39 @@ fn test_layout_table_cell_positions() {
         }],
         active_header: None,
         active_footer: None,
-        page_number_pos: None, page_hide: None,
+        page_number_pos: None,
+        page_hide: None,
         footnotes: Vec::new(),
-        active_master_page: None, extra_master_pages: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
     };
 
-    let tree = engine.build_render_tree(&page_content, &paragraphs, &paragraphs, &paragraphs, &composed, &styles, &FootnoteShape::default(), &[], None, &[], None, 0, &[]);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &composed,
+        &styles,
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    );
 
-    let body = tree.root.children.iter()
+    let body = tree
+        .root
+        .children
+        .iter()
         .find(|n| matches!(n.node_type, RenderNodeType::Body { .. }))
         .unwrap();
     let col = &body.children[0];
-    let table_node = col.children.iter()
+    let table_node = col
+        .children
+        .iter()
         .find(|n| matches!(n.node_type, RenderNodeType::Table(_)))
         .unwrap();
 
@@ -812,22 +1147,49 @@ fn test_numbering_state_advance() {
 fn test_expand_numbering_format_digit() {
     let numbering = Numbering {
         raw_data: None,
-        heads: [NumberingHead { number_format: 0, ..Default::default() }; 7],
+        heads: [NumberingHead {
+            number_format: 0,
+            ..Default::default()
+        }; 7],
         level_formats: [
-            "^1.".to_string(), "^2.".to_string(), "^3)".to_string(),
-            String::new(), String::new(), String::new(), String::new(),
+            "^1.".to_string(),
+            "^2.".to_string(),
+            "^3)".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
         ],
         start_number: 0,
         level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
     };
     let counters = [3, 2, 1, 0, 0, 0, 0];
-    let result = expand_numbering_format("^1.", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "^1.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
     assert_eq!(result, "3.");
 
-    let result = expand_numbering_format("^2.", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "^2.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
     assert_eq!(result, "2.");
 
-    let result = expand_numbering_format("(^3)", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "(^3)",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        2,
+    );
     assert_eq!(result, "(1)");
 }
 
@@ -839,24 +1201,179 @@ fn test_expand_numbering_format_hangul() {
         raw_data: None,
         heads,
         level_formats: [
-            String::new(), "^2.".to_string(), String::new(),
-            String::new(), String::new(), String::new(), String::new(),
+            String::new(),
+            "^2.".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
         ],
         start_number: 0,
         level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
     };
     let counters = [1, 3, 0, 0, 0, 0, 0];
-    let result = expand_numbering_format("^2.", &counters, &numbering, &numbering.level_start_numbers);
+    let result = expand_numbering_format(
+        "^2.",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
     assert_eq!(result, "다.");
 }
 
 #[test]
+fn test_expand_numbering_format_level_path() {
+    // ^n/^N: 레벨 경로 자동코드 (#2145). 재현 문서는 전 수준 "^N".
+    let numbering = Numbering {
+        raw_data: None,
+        heads: [NumberingHead {
+            number_format: 0,
+            ..Default::default()
+        }; 7],
+        level_formats: [
+            "^N".to_string(),
+            "^N".to_string(),
+            "^N".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        start_number: 0,
+        level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
+    };
+
+    // level 0: "1.", 카운터 전진 후 "2."
+    let counters = [1, 0, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
+    assert_eq!(result, "1.");
+    let counters = [2, 0, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        0,
+    );
+    assert_eq!(result, "2.");
+
+    // level 1: "1.1." → "1.4."
+    let counters = [1, 1, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.1.");
+    let counters = [1, 4, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.4.");
+
+    // ^n: 후행 마침표 없음
+    let counters = [2, 3, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^n",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "2.3");
+
+    // 접두·접미 문자 보존
+    let result = expand_numbering_format(
+        "[^n]",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "[2.3]");
+
+    // 상위 수준 카운터 0이면 시작번호로 폴백
+    let counters = [0, 2, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.2.");
+}
+
+#[test]
+fn test_expand_numbering_format_level_path_mixed_format() {
+    // 수준별 number_format 혼합: L1=Digit, L2=HangulGaNaDa → "1.가."
+    let mut heads = [NumberingHead::default(); 7];
+    heads[1].number_format = 8; // HangulGaNaDa
+    let numbering = Numbering {
+        raw_data: None,
+        heads,
+        level_formats: [
+            "^N".to_string(),
+            "^N".to_string(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        ],
+        start_number: 0,
+        level_start_numbers: [1, 1, 1, 1, 1, 1, 1],
+        raw_para_heads: None,
+    };
+    let counters = [1, 1, 0, 0, 0, 0, 0];
+    let result = expand_numbering_format(
+        "^N",
+        &counters,
+        &numbering,
+        &numbering.level_start_numbers,
+        1,
+    );
+    assert_eq!(result, "1.가.");
+}
+
+#[test]
 fn test_numbering_format_to_number_format() {
-    assert!(matches!(numbering_format_to_number_format(0), NumFmt::Digit));
-    assert!(matches!(numbering_format_to_number_format(1), NumFmt::CircledDigit));
-    assert!(matches!(numbering_format_to_number_format(2), NumFmt::RomanUpper));
-    assert!(matches!(numbering_format_to_number_format(8), NumFmt::HangulGaNaDa));
-    assert!(matches!(numbering_format_to_number_format(255), NumFmt::Digit));
+    assert!(matches!(
+        numbering_format_to_number_format(0),
+        NumFmt::Digit
+    ));
+    assert!(matches!(
+        numbering_format_to_number_format(1),
+        NumFmt::CircledDigit
+    ));
+    assert!(matches!(
+        numbering_format_to_number_format(2),
+        NumFmt::RomanUpper
+    ));
+    assert!(matches!(
+        numbering_format_to_number_format(8),
+        NumFmt::HangulGaNaDa
+    ));
+    assert!(matches!(
+        numbering_format_to_number_format(255),
+        NumFmt::Digit
+    ));
 }
 
 // =====================================================================
@@ -959,14 +1476,19 @@ fn test_geometric_shapes_treated_as_fullwidth() {
     // Task #146: Geometric Shapes (U+25A0-U+25FF) 는 HWP 문서의 섹션 머리
     // 기호 (□ 1. / ■ 가. / ○ ㅇ 등) 로 널리 쓰이므로 전각(font_size) 폭
     // 으로 측정되어야 한다.
-    let style = TextStyle { font_size: 20.0, ..Default::default() };
+    let style = TextStyle {
+        font_size: 20.0,
+        ..Default::default()
+    };
     for c in ['□', '■', '▲', '▼', '◆', '○', '●', '◇'] {
         let text = c.to_string();
         let positions = compute_char_positions(&text, &style);
         assert!(
             (positions[1] - 20.0).abs() < 0.01,
             "'{}' (U+{:04X}) expected full-width advance 20.0, got {}",
-            c, c as u32, positions[1]
+            c,
+            c as u32,
+            positions[1]
         );
     }
 }
@@ -984,11 +1506,23 @@ fn test_square_bullet_with_space_preserves_layout() {
     let positions = compute_char_positions("□ 가", &style);
     assert_eq!(positions.len(), 4);
     // □: 전각(20) + 자간(-1.6) = advance 18.4
-    assert!((positions[1] - 18.4).abs() < 0.01, "positions[1] expected 18.4, got {}", positions[1]);
+    assert!(
+        (positions[1] - 18.4).abs() < 0.01,
+        "positions[1] expected 18.4, got {}",
+        positions[1]
+    );
     // 공백: 반각(10) + 자간(-1.6) = advance 8.4 (min_clamp 5.0 미작동)
-    assert!((positions[2] - 26.8).abs() < 0.01, "positions[2] expected 26.8, got {}", positions[2]);
+    assert!(
+        (positions[2] - 26.8).abs() < 0.01,
+        "positions[2] expected 26.8, got {}",
+        positions[2]
+    );
     // 가: 전각(20) + 자간(-1.6) = advance 18.4
-    assert!((positions[3] - 45.2).abs() < 0.01, "positions[3] expected 45.2, got {}", positions[3]);
+    assert!(
+        (positions[3] - 45.2).abs() < 0.01,
+        "positions[3] expected 45.2, got {}",
+        positions[3]
+    );
 }
 
 #[test]
@@ -996,18 +1530,23 @@ fn test_tac_leading_width_block_table_full_line() {
     // Task #146 v3: block 취급 TAC 표(너비 ≥ 90% seg_width)에서
     // composed.tac_controls 가 비어있을 때, 선행 텍스트는 line 0 전체로
     // 간주해 모든 run 폭을 합산해야 한다. text-align.hwp 문단 0.2 시나리오.
-    use super::super::composer::{ComposedParagraph, ComposedLine, ComposedTextRun};
-    use crate::renderer::style_resolver::{ResolvedStyleSet, ResolvedCharStyle};
+    use super::super::composer::{ComposedLine, ComposedParagraph, ComposedTextRun};
+    use crate::renderer::style_resolver::{ResolvedCharStyle, ResolvedStyleSet};
 
     let line = ComposedLine {
         runs: vec![ComposedTextRun {
             text: "    ".to_string(),
-            char_style_id: 0, lang_index: 0,
+            char_style_id: 0,
+            lang_index: 0,
             ..Default::default()
         }],
-        line_height: 400, baseline_distance: 320,
-        segment_width: 48188, column_start: 0,
-        line_spacing: 0, has_line_break: false, char_start: 0,
+        line_height: 400,
+        baseline_distance: 320,
+        segment_width: 48188,
+        column_start: 0,
+        line_spacing: 0,
+        has_line_break: false,
+        char_start: 0,
     };
     let composed = ComposedParagraph {
         lines: vec![line],
@@ -1020,7 +1559,8 @@ fn test_tac_leading_width_block_table_full_line() {
     };
     let styles = ResolvedStyleSet {
         char_styles: vec![ResolvedCharStyle {
-            font_size: 20.0, letter_spacing: -1.6,
+            font_size: 20.0,
+            letter_spacing: -1.6,
             ..Default::default()
         }],
         ..Default::default()
@@ -1038,13 +1578,29 @@ fn test_is_heavy_display_face_matches_known_heavy_faces() {
     // Task #574: HY견명조 는 한컴 일반 두께 명조 — heavy 가 아님. 제거.
     // HY견명조B 는 명시 Bold variant — 보존.
     use crate::renderer::style_resolver::is_heavy_display_face;
-    for face in ["HY헤드라인M", "HYHeadLine M", "HYHeadLine Medium",
-                  "HY견고딕", "HY견명조B", "HY그래픽", "HY그래픽M"] {
+    for face in [
+        "HY헤드라인M",
+        "HYHeadLine M",
+        "HYHeadLine Medium",
+        "HY견고딕",
+        "HY견명조B",
+        "HY그래픽",
+        "HY그래픽M",
+    ] {
         assert!(is_heavy_display_face(face), "{} should be heavy", face);
     }
     // 일반 face 는 false (HY견명조 는 Task #574 에서 heavy 제거)
-    for face in ["Malgun Gothic", "맑은 고딕", "함초롬바탕", "함초롬돋움",
-                  "바탕", "돋움", "HY신명조", "HY중고딕", "HY견명조"] {
+    for face in [
+        "Malgun Gothic",
+        "맑은 고딕",
+        "함초롬바탕",
+        "함초롬돋움",
+        "바탕",
+        "돋움",
+        "HY신명조",
+        "HY중고딕",
+        "HY견명조",
+    ] {
         assert!(!is_heavy_display_face(face), "{} should NOT be heavy", face);
     }
 }
@@ -1053,7 +1609,9 @@ fn test_is_heavy_display_face_matches_known_heavy_faces() {
 fn test_is_heavy_display_face_with_family_chain() {
     // font-family 체인에서 primary face(첫 항목) 기준 판정.
     use crate::renderer::style_resolver::is_heavy_display_face;
-    assert!(is_heavy_display_face("HY헤드라인M,'Malgun Gothic',sans-serif"));
+    assert!(is_heavy_display_face(
+        "HY헤드라인M,'Malgun Gothic',sans-serif"
+    ));
     assert!(is_heavy_display_face("HY견고딕, 돋움"));
     // 따옴표 포함
     assert!(is_heavy_display_face("'HY헤드라인M',Malgun Gothic"));
@@ -1065,18 +1623,23 @@ fn test_is_heavy_display_face_with_family_chain() {
 #[test]
 fn test_tac_leading_width_inline_table_partial() {
     // inline 취급 TAC 표: tac_controls 에 위치 기록. 해당 위치까지만 합산.
-    use super::super::composer::{ComposedParagraph, ComposedLine, ComposedTextRun};
-    use crate::renderer::style_resolver::{ResolvedStyleSet, ResolvedCharStyle};
+    use super::super::composer::{ComposedLine, ComposedParagraph, ComposedTextRun};
+    use crate::renderer::style_resolver::{ResolvedCharStyle, ResolvedStyleSet};
 
     let line = ComposedLine {
         runs: vec![ComposedTextRun {
             text: "ab가나".to_string(),
-            char_style_id: 0, lang_index: 0,
+            char_style_id: 0,
+            lang_index: 0,
             ..Default::default()
         }],
-        line_height: 400, baseline_distance: 320,
-        segment_width: 48188, column_start: 0,
-        line_spacing: 0, has_line_break: false, char_start: 0,
+        line_height: 400,
+        baseline_distance: 320,
+        segment_width: 48188,
+        column_start: 0,
+        line_spacing: 0,
+        has_line_break: false,
+        char_start: 0,
     };
     let composed = ComposedParagraph {
         lines: vec![line],
@@ -1089,7 +1652,8 @@ fn test_tac_leading_width_inline_table_partial() {
     };
     let styles = ResolvedStyleSet {
         char_styles: vec![ResolvedCharStyle {
-            font_size: 20.0, ..Default::default()
+            font_size: 20.0,
+            ..Default::default()
         }],
         ..Default::default()
     };
@@ -1122,7 +1686,11 @@ fn task290_inline_left_returns_none() {
     // inline 이 LEFT (ext[2] high=1) 이면 pending 없음 — 본 수정의 핵심
     let ext = vec![mk_ext(100, 1, 0)]; // LEFT, fill=none
     let ts = mk_text_style();
-    let tab_stops = vec![TabStop { position: 22.0, tab_type: 0, fill_type: 0 }];
+    let tab_stops = vec![TabStop {
+        position: 22.0,
+        tab_type: 0,
+        fill_type: 0,
+    }];
     let result = super::paragraph_layout::resolve_last_tab_pending(
         "abc\t", 0, &ext, &ts, &tab_stops, 48.0, true, 420.0,
     );
@@ -1134,11 +1702,19 @@ fn task290_inline_right_uses_tabdef() {
     // inline 이 RIGHT (ext[2] high=2) 면 TabDef find_next_tab_stop 경로로 폴스루
     let ext = vec![mk_ext(200, 2, 3)]; // RIGHT, fill=dot
     let ts = mk_text_style();
-    let tab_stops = vec![TabStop { position: 300.0, tab_type: 1, fill_type: 3 }];
+    let tab_stops = vec![TabStop {
+        position: 300.0,
+        tab_type: 1,
+        fill_type: 3,
+    }];
     let result = super::paragraph_layout::resolve_last_tab_pending(
         "abc\t", 0, &ext, &ts, &tab_stops, 48.0, false, 420.0,
     );
-    assert_eq!(result, Some((300.0, 1, 3)), "RIGHT inline → TabDef 기반 위치, fill=dot");
+    assert_eq!(
+        result,
+        Some((300.0, 1, 3)),
+        "RIGHT inline → TabDef 기반 위치, fill=dot"
+    );
 }
 
 #[test]
@@ -1146,11 +1722,19 @@ fn task290_inline_center_uses_tabdef() {
     // inline 이 CENTER (ext[2] high=3) 면 TabDef 기반 위치
     let ext = vec![mk_ext(150, 3, 0)]; // CENTER
     let ts = mk_text_style();
-    let tab_stops = vec![TabStop { position: 200.0, tab_type: 2, fill_type: 0 }];
+    let tab_stops = vec![TabStop {
+        position: 200.0,
+        tab_type: 2,
+        fill_type: 0,
+    }];
     let result = super::paragraph_layout::resolve_last_tab_pending(
         "abc\t", 0, &ext, &ts, &tab_stops, 48.0, false, 420.0,
     );
-    assert_eq!(result, Some((200.0, 2, 0)), "CENTER inline → TabDef 기반 위치, fill 없음");
+    assert_eq!(
+        result,
+        Some((200.0, 2, 0)),
+        "CENTER inline → TabDef 기반 위치, fill 없음"
+    );
 }
 
 #[test]
@@ -1158,11 +1742,19 @@ fn task290_no_inline_fallback_to_tabdef() {
     // inline_tabs 가 비었으면 TabDef 폴백 — 기존 동작 유지
     let ext: Vec<[u16; 7]> = vec![];
     let ts = mk_text_style();
-    let tab_stops = vec![TabStop { position: 250.0, tab_type: 1, fill_type: 0 }];
+    let tab_stops = vec![TabStop {
+        position: 250.0,
+        tab_type: 1,
+        fill_type: 0,
+    }];
     let result = super::paragraph_layout::resolve_last_tab_pending(
         "abc\t", 0, &ext, &ts, &tab_stops, 48.0, false, 420.0,
     );
-    assert_eq!(result, Some((250.0, 1, 0)), "inline 없음 → TabDef RIGHT stop 사용, fill 없음");
+    assert_eq!(
+        result,
+        Some((250.0, 1, 0)),
+        "inline 없음 → TabDef RIGHT stop 사용, fill 없음"
+    );
 }
 
 #[test]
@@ -1170,14 +1762,21 @@ fn task290_no_inline_auto_tab_right_fallthrough() {
     // inline 없음 + TabDef stop 소진 + auto_tab_right=true → 우측 끝 RIGHT (기존 동작 유지)
     let ext: Vec<[u16; 7]> = vec![];
     let ts = mk_text_style();
-    let tab_stops = vec![TabStop { position: 10.0, tab_type: 0, fill_type: 0 }]; // 이미 지나친 stop
+    let tab_stops = vec![TabStop {
+        position: 10.0,
+        tab_type: 0,
+        fill_type: 0,
+    }]; // 이미 지나친 stop
     let result = super::paragraph_layout::resolve_last_tab_pending(
         "abcdef\t", 0, &ext, &ts, &tab_stops, 48.0, true, 420.0,
     );
     assert!(result.is_some(), "auto_tab_right 폴스루 → Some");
     let (tp, tt, _ft) = result.unwrap();
     assert_eq!(tt, 1, "auto_tab_right 은 RIGHT(1)");
-    assert!((tp - 420.0).abs() < 0.1, "tab_pos 는 available_width 에 고정");
+    assert!(
+        (tp - 420.0).abs() < 0.1,
+        "tab_pos 는 available_width 에 고정"
+    );
 }
 
 // [Task #296] inline_tab_type 헬퍼 단위 테스트
@@ -1210,4 +1809,483 @@ fn task296_inline_tab_type_decimal() {
     // ext[2] = 0x0400 → high=4 = DECIMAL
     let ext = [100u16, 0, 0x0400, 0, 0, 0, 9];
     assert_eq!(super::text_measurement::inline_tab_type(&ext), 4);
+}
+
+#[test]
+fn task1197_paper_nodes_sort_by_plane_z_order_and_stable_index() {
+    fn node(id: u32, text_wrap: TextWrap, z_order: i32, stable_index: u32) -> RenderNode {
+        RenderNode::new(
+            id,
+            RenderNodeType::Column(0),
+            BoundingBox::new(0.0, 0.0, 1.0, 1.0),
+        )
+        .with_layer(RenderLayerInfo::new(Some(text_wrap), z_order, stable_index))
+    }
+
+    let mut nodes = vec![
+        node(1, TextWrap::InFrontOfText, 0, 0),
+        node(2, TextWrap::BehindText, 11, 2),
+        node(3, TextWrap::BehindText, 1, 3),
+        node(4, TextWrap::TopAndBottom, 0, 0),
+        node(5, TextWrap::BehindText, 11, 1),
+    ];
+
+    LayoutEngine::sort_paper_render_nodes(&mut nodes);
+
+    let order: Vec<u32> = nodes.iter().map(|node| node.id).collect();
+    assert_eq!(
+        order,
+        vec![3, 5, 2, 4, 1],
+        "BehindText는 z-order/stable 순서로 먼저, flow, InFrontOfText 순으로 정렬"
+    );
+}
+
+#[test]
+fn master_page_controls_sort_by_render_layer_z_order() {
+    fn rect_control(z_order: i32, horizontal_offset: u32) -> Control {
+        Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+            common: CommonObjAttr {
+                width: 10_000,
+                height: 10_000,
+                horizontal_offset,
+                z_order,
+                text_wrap: TextWrap::InFrontOfText,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                ..Default::default()
+            },
+            ..Default::default()
+        })))
+    }
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let mut tree = PageRenderTree::new(0, layout.page_width, layout.page_height);
+    let master_page = MasterPage {
+        paragraphs: vec![Paragraph {
+            controls: vec![
+                rect_control(20, 0),
+                rect_control(10, 20_000),
+                rect_control(20, 40_000),
+            ],
+            ..Default::default()
+        }],
+        text_width: 10_000,
+        text_height: 10_000,
+        ..Default::default()
+    };
+
+    engine.build_master_page_into(
+        &mut tree,
+        Some(&master_page),
+        &layout,
+        &[],
+        &ResolvedStyleSet::default(),
+        &[],
+        0,
+        1,
+    );
+
+    let master_node = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::MasterPage))
+        .expect("master page node should be rendered");
+    let z_order: Vec<i32> = master_node
+        .children
+        .iter()
+        .filter_map(|node| match node.node_type {
+            RenderNodeType::Rectangle(_) => node.layer.map(|layer| layer.z_order),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(
+        z_order,
+        vec![10, 20, 20],
+        "master-page children should replay Hancom object order, not raw control order"
+    );
+}
+
+fn first_master_child_layer<F>(tree: &PageRenderTree, predicate: F) -> RenderLayerInfo
+where
+    F: Fn(&RenderNodeType) -> bool + Copy,
+{
+    fn find<F>(node: &RenderNode, predicate: F) -> Option<RenderLayerInfo>
+    where
+        F: Fn(&RenderNodeType) -> bool + Copy,
+    {
+        if predicate(&node.node_type) {
+            return node.layer;
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, predicate))
+    }
+
+    let master = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::MasterPage))
+        .expect("master page node should be rendered");
+    find(master, predicate).expect("matching master-page child should carry a layer")
+}
+
+fn master_rect_control(width: u32, height: u32) -> Control {
+    Control::Shape(Box::new(ShapeObject::Rectangle(RectangleShape {
+        common: CommonObjAttr {
+            width,
+            height,
+            text_wrap: TextWrap::InFrontOfText,
+            horz_rel_to: HorzRelTo::Paper,
+            vert_rel_to: VertRelTo::Paper,
+            horz_align: HorzAlign::Left,
+            vert_align: VertAlign::Top,
+            ..Default::default()
+        },
+        ..Default::default()
+    })))
+}
+
+#[test]
+fn master_page_paper_sized_background_replays_behind_body_text() {
+    let page = a4_page_def();
+    let tree = render_tree_with_master_page_control(master_rect_control(page.width, page.height));
+    let layer = first_master_child_layer(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+
+    assert_eq!(layer.text_wrap, Some(TextWrap::BehindText));
+}
+
+#[test]
+fn master_page_smaller_front_control_stays_in_front_of_body_text() {
+    let page = a4_page_def();
+    let tree =
+        render_tree_with_master_page_control(master_rect_control(page.width / 2, page.height / 2));
+    let layer = first_master_child_layer(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+
+    assert_eq!(layer.text_wrap, Some(TextWrap::InFrontOfText));
+}
+
+fn first_master_child_bbox<F>(tree: &PageRenderTree, predicate: F) -> BoundingBox
+where
+    F: Fn(&RenderNodeType) -> bool + Copy,
+{
+    fn find<F>(node: &RenderNode, predicate: F) -> Option<BoundingBox>
+    where
+        F: Fn(&RenderNodeType) -> bool + Copy,
+    {
+        if predicate(&node.node_type) {
+            return Some(node.bbox);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, predicate))
+    }
+
+    let master = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::MasterPage))
+        .expect("master page node should be rendered");
+    find(master, predicate).expect("matching master-page child should be rendered")
+}
+
+fn render_tree_with_master_page_control(control: Control) -> PageRenderTree {
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let mut tree = PageRenderTree::new(0, layout.page_width, layout.page_height);
+    let master_page = MasterPage {
+        paragraphs: vec![Paragraph {
+            controls: vec![control],
+            ..Default::default()
+        }],
+        text_width: 10_000,
+        text_height: 10_000,
+        ..Default::default()
+    };
+
+    engine.build_master_page_into(
+        &mut tree,
+        Some(&master_page),
+        &layout,
+        &[],
+        &ResolvedStyleSet::default(),
+        &[],
+        0,
+        1,
+    );
+    tree
+}
+
+#[test]
+fn master_page_paper_relative_shape_uses_page_origin() {
+    let tree = render_tree_with_master_page_control(Control::Shape(Box::new(
+        ShapeObject::Rectangle(RectangleShape {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        }),
+    )));
+
+    let bbox = first_master_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+#[test]
+fn master_page_paper_relative_picture_uses_page_origin() {
+    let tree = render_tree_with_master_page_control(Control::Picture(Box::new(
+        crate::model::image::Picture {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    )));
+
+    let bbox = first_master_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Image(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+fn first_header_child_bbox<F>(tree: &PageRenderTree, predicate: F) -> BoundingBox
+where
+    F: Fn(&RenderNodeType) -> bool + Copy,
+{
+    fn find<F>(node: &RenderNode, predicate: F) -> Option<BoundingBox>
+    where
+        F: Fn(&RenderNodeType) -> bool + Copy,
+    {
+        if predicate(&node.node_type) {
+            return Some(node.bbox);
+        }
+        node.children
+            .iter()
+            .find_map(|child| find(child, predicate))
+    }
+
+    let header = tree
+        .root
+        .children
+        .iter()
+        .find(|node| matches!(node.node_type, RenderNodeType::Header))
+        .expect("header node should be rendered");
+    find(header, predicate).expect("matching header child should be rendered")
+}
+
+fn render_tree_with_header_control(control: Control) -> PageRenderTree {
+    use crate::model::header_footer::Header;
+    use crate::renderer::pagination::HeaderFooterRef;
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let paragraphs = vec![Paragraph {
+        controls: vec![Control::Header(Box::new(Header {
+            paragraphs: vec![Paragraph {
+                controls: vec![control],
+                ..Default::default()
+            }],
+            ..Default::default()
+        }))],
+        ..Default::default()
+    }];
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 1,
+        section_index: 0,
+        layout,
+        column_contents: Vec::new(),
+        active_header: Some(HeaderFooterRef {
+            para_index: 0,
+            control_index: 0,
+            source_section_index: 0,
+        }),
+        active_footer: None,
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+    };
+    engine.build_render_tree(
+        &page_content,
+        &paragraphs,
+        &paragraphs,
+        &paragraphs,
+        &[],
+        &ResolvedStyleSet::default(),
+        &FootnoteShape::default(),
+        &[],
+        None,
+        &[],
+        None,
+        0,
+        &[],
+    )
+}
+
+#[test]
+fn header_paper_relative_shape_uses_page_origin() {
+    let tree = render_tree_with_header_control(Control::Shape(Box::new(ShapeObject::Rectangle(
+        RectangleShape {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    ))));
+
+    let bbox = first_header_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Rectangle(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+#[test]
+fn header_paper_relative_picture_uses_page_origin() {
+    let tree =
+        render_tree_with_header_control(Control::Picture(Box::new(crate::model::image::Picture {
+            common: CommonObjAttr {
+                width: 7_500,
+                height: 3_000,
+                horizontal_offset: 1_500,
+                vertical_offset: 2_250,
+                horz_rel_to: HorzRelTo::Paper,
+                vert_rel_to: VertRelTo::Paper,
+                text_wrap: TextWrap::InFrontOfText,
+                ..Default::default()
+            },
+            ..Default::default()
+        })));
+
+    let bbox = first_header_child_bbox(&tree, |node_type| {
+        matches!(node_type, RenderNodeType::Image(_))
+    });
+    assert!((bbox.x - hwpunit_to_px(1_500, DEFAULT_DPI)).abs() < 0.01);
+    assert!((bbox.y - hwpunit_to_px(2_250, DEFAULT_DPI)).abs() < 0.01);
+}
+
+// [Task #2102] 쪽 배경 이미지 채우기는 구역 첫 쪽에만 적용된다.
+// 색 채우기는 첫 쪽 여부와 무관하게 유지된다.
+
+/// 이미지 채우기 + 색 채우기를 가진 쪽 테두리/배경으로 렌더 트리를 만든 뒤
+/// 루트 자식에서 PageBackground 노드를 찾아 (background_color, image 유무) 를 반환.
+fn page_bg_color_and_image_present(is_section_first: bool) -> (bool, bool) {
+    use crate::model::bin_data::BinDataContent;
+    use crate::model::image::ImageEffect;
+    use crate::model::page::PageBorderFill;
+    use crate::model::style::ImageFillMode;
+    use crate::renderer::style_resolver::{ResolvedBorderStyle, ResolvedImageFill};
+
+    let engine = LayoutEngine::with_default_dpi();
+    let layout = PageLayoutInfo::from_page_def_default(&a4_page_def(), &ColumnDef::default());
+    let page_content = PageContent {
+        page_index: 0,
+        page_number: 0,
+        section_index: 0,
+        layout,
+        column_contents: Vec::new(),
+        active_header: None,
+        active_footer: None,
+        page_number_pos: None,
+        page_hide: None,
+        footnotes: Vec::new(),
+        active_master_page: None,
+        extra_master_pages: Vec::new(),
+    };
+
+    let styles = ResolvedStyleSet {
+        border_styles: vec![ResolvedBorderStyle {
+            fill_color: Some(0x00F0F0F0),
+            image_fill: Some(ResolvedImageFill {
+                bin_data_id: 1,
+                fill_mode: ImageFillMode::FitToSize,
+                brightness: 0,
+                contrast: 0,
+                effect: ImageEffect::RealPic,
+            }),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let bin_data = vec![BinDataContent {
+        id: 1,
+        data: vec![0xFF, 0xD8, 0xFF, 0xE0], // JPEG magic (내용 무관, 존재만 확인)
+        extension: "jpg".to_string(),
+    }];
+    let page_border_fill = PageBorderFill {
+        border_fill_id: 1,
+        ..Default::default()
+    };
+
+    engine.set_current_page_is_section_first(is_section_first);
+    let tree = engine.build_render_tree(
+        &page_content,
+        &[],
+        &[],
+        &[],
+        &[],
+        &styles,
+        &FootnoteShape::default(),
+        &bin_data,
+        None,
+        &[],
+        Some(&page_border_fill),
+        0,
+        &[],
+    );
+
+    let bg = tree.root.children.iter().find_map(|c| match &c.node_type {
+        RenderNodeType::PageBackground(bg) => Some(bg),
+        _ => None,
+    });
+    let bg = bg.expect("PageBackground 노드가 있어야 함");
+    (bg.background_color.is_some(), bg.image.is_some())
+}
+
+#[test]
+fn page_bg_image_only_on_section_first_page() {
+    // 구역 첫 쪽: 이미지 채우기 적용
+    let (color_first, image_first) = page_bg_color_and_image_present(true);
+    assert!(image_first, "구역 첫 쪽에는 배경 이미지가 있어야 한다");
+    assert!(color_first, "색 채우기는 유지되어야 한다");
+
+    // 구역 첫 쪽 아님: 이미지 채우기 억제, 색 채우기는 유지
+    let (color_rest, image_rest) = page_bg_color_and_image_present(false);
+    assert!(!image_rest, "구역 첫 쪽이 아니면 배경 이미지가 없어야 한다");
+    assert!(color_rest, "이미지가 억제돼도 색 채우기는 유지되어야 한다");
 }

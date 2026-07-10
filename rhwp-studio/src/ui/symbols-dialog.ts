@@ -5,6 +5,7 @@
  */
 import type { CommandServices } from '@/command/types';
 import { InsertTextCommand } from '@/engine/command';
+import { enableDialogDrag } from './dialog-drag';
 
 // ── 유니코드 블록 정의 ──
 
@@ -134,6 +135,7 @@ export class SymbolsDialog {
     closeBtn.addEventListener('click', () => this.hide());
     titleBar.appendChild(closeBtn);
     this.dialog.appendChild(titleBar);
+    enableDialogDrag(this.dialog, titleBar);
 
     // 본문
     const body = document.createElement('div');
@@ -227,9 +229,6 @@ export class SymbolsDialog {
     this.dialog.appendChild(footer);
 
     this.overlay.appendChild(this.dialog);
-    this.overlay.addEventListener('click', (e) => {
-      if (e.target === this.overlay) this.hide();
-    });
   }
 
   // ── 블록 선택 ──

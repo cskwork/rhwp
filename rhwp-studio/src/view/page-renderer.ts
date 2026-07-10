@@ -1,186 +1,539 @@
 import { WasmBridge } from '@/core/wasm-bridge';
+import type { LayerRenderProfile } from '@/core/types';
+import type { CanvasKitLayerRenderer } from './canvaskit-renderer';
+import type { RenderBackend } from './render-backend';
 
-/**
- * PageLayerTree JSON 의 PaintOp::Image 메타정보 (Task #516, Stage 5.2).
- * BehindText / InFrontOfText 그림 overlay 생성에 사용.
- */
-export interface OverlayImageInfo {
-  bbox: { x: number; y: number; width: number; height: number };
-  mime: string;
-  base64: string;
-  effect: string;
-  brightness: number;
-  contrast: number;
-  watermark?: { preset: 'hancom-watermark' | 'custom' };
-  wrap: 'behindText' | 'inFrontOfText';
-  transform?: { rotation: number; horzFlip: boolean; vertFlip: boolean };
+interface LayerPlaneSummary {
+  hasBehind: boolean;
+  hasFront: boolean;
+  imageCount: number;
+  rawSvgCount: number;  // OLE/차트 rawSvg op 수 — 비동기 디코드 재렌더 트리거용(image 와 의미 분리, #1456)
+  flowImageCount: number;
+  flowRawSvgCount: number;
+  flowStaticCount: number;
+  signature: string;
+}
+
+export interface PageRenderContext {
+  reason?: 'text-edit' | 'unknown';
+  allowStaticOverlayReuse?: boolean;
+}
+
+export interface PageRenderResult {
+  needsTextEditStaticLayerVerification: boolean;
+}
+
+type OverlayLayerKind = 'background' | 'behind' | 'front';
+type StaticCanvasLayerKind = OverlayLayerKind | 'flow-static';
+
+interface ReRenderPolicy {
+  retrySignature: string;
+  reuseStaticFlow: boolean;
+  reuseStaticOverlay: boolean;
+}
+
+interface LayerSummaryCacheEntry {
+  key: string;
+  summary: LayerPlaneSummary;
 }
 
 export class PageRenderer {
   private reRenderTimers = new Map<number, ReturnType<typeof setTimeout>[]>();
+  private imageRetryCounts = new Map<number, string>();
+  private layerSummaryCache = new Map<number, LayerSummaryCacheEntry>();
+  private flowSplitSupported: boolean | null = null;
 
-  constructor(private wasm: WasmBridge) {}
+  constructor(
+    private wasm: WasmBridge,
+    private backend: RenderBackend = 'canvas2d',
+    private renderProfile: LayerRenderProfile = 'screen',
+    private canvaskitRenderer: CanvasKitLayerRenderer | null = null,
+  ) {}
 
-  /** 페이지를 Canvas에 렌더링한다 (scale = zoom × DPR) */
-  renderPage(pageIdx: number, canvas: HTMLCanvasElement, scale: number): void {
-    // Task #516 Stage 5.2: 다층 layer 모드.
-    // 1) 본문 Canvas 는 'flow' 필터로 BehindText/InFrontOfText 그림 제외
-    // 2) overlay (BehindText / InFrontOfText) 는 같은 부모 컨테이너에 <img> 로 추가
-    this.wasm.renderPageToCanvasFiltered(pageIdx, canvas, scale, 'flow');
-    this.drawMarginGuides(pageIdx, canvas, scale);
-    this.applyOverlays(pageIdx, canvas, scale);
-    this.scheduleReRender(pageIdx, canvas, scale);
+  /** 페이지를 Canvas에 렌더링한다 (renderScale = zoom × DPR) */
+  renderPage(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+    _displayScale: number,
+    dpr: number,
+    context: PageRenderContext = {},
+  ): PageRenderResult {
+    if (this.backend === 'canvaskit') {
+      this.layerSummaryCache.delete(pageIdx);
+      this.renderPageCanvasKit(pageIdx, canvas, renderScale);
+      return { needsTextEditStaticLayerVerification: false };
+    }
+
+    const layers = this.getLayerPlaneSummary(pageIdx, canvas, renderScale, context);
+    const preferStaticFlow = this.shouldUseStaticFlowReuse(context, layers);
+    let reuseStaticFlow = this.renderFlowCanvas(pageIdx, canvas, renderScale, preferStaticFlow);
+
+    // 다층 layer 모드.
+    // 1) 본문 Canvas 는 'flow' 필터로 BehindText/InFrontOfText plane 제외
+    // 2) behind/front plane 은 같은 부모 컨테이너에 별도 canvas layer 로 합성
+    this.drawMarginGuides(pageIdx, canvas, renderScale);
+    let overlays: LayerPlaneSummary;
+    try {
+      overlays = this.applyOverlays(pageIdx, canvas, renderScale, dpr, context, layers, reuseStaticFlow);
+    } catch (error) {
+      if (!reuseStaticFlow) throw error;
+      this.flowSplitSupported = false;
+      canvas.parentElement && this.removeOverlayLayer(canvas.parentElement, pageIdx, 'flow-static');
+      reuseStaticFlow = false;
+      this.wasm.renderPageToCanvasFiltered(pageIdx, canvas, renderScale, 'flow');
+      this.drawMarginGuides(pageIdx, canvas, renderScale);
+      overlays = this.applyOverlays(pageIdx, canvas, renderScale, dpr, context, layers, false);
+    }
+    this.rememberLayerPlaneSummary(pageIdx, canvas, renderScale, layers);
+    // rawSvg(차트/OLE)도 web_canvas draw_image 비동기 디코드 경로를 타므로
+    // image 와 함께 재렌더 트리거 카운트에 합산한다(#1456).
+    this.scheduleReRender(pageIdx, canvas, renderScale, overlays.imageCount + overlays.rawSvgCount, {
+      retrySignature: overlays.signature,
+      reuseStaticFlow,
+      reuseStaticOverlay: context.reason === 'text-edit' && context.allowStaticOverlayReuse === true,
+    });
+    return {
+      needsTextEditStaticLayerVerification:
+        context.reason === 'text-edit' &&
+        context.allowStaticOverlayReuse === true &&
+        (reuseStaticFlow || layers.hasBehind || layers.hasFront),
+    };
+  }
+
+  getBackend(): RenderBackend {
+    return this.backend;
+  }
+
+  private renderPageCanvasKit(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+  ): void {
+    if (!this.canvaskitRenderer) {
+      throw new Error('CanvasKit renderer가 초기화되지 않았습니다');
+    }
+
+    const parent = canvas.parentElement;
+    if (parent) {
+      this.removePageLayers(parent, pageIdx);
+    }
+
+    const pageInfo = this.wasm.getPageInfo(pageIdx);
+    canvas.width = Math.max(1, Math.floor(pageInfo.width * renderScale));
+    canvas.height = Math.max(1, Math.floor(pageInfo.height * renderScale));
+
+    const tree = this.wasm.getPageLayerTreeObject(pageIdx, this.renderProfile);
+    try {
+      this.canvaskitRenderer.renderPage(tree, canvas, renderScale, pageInfo);
+    } catch (error) {
+      this.canvaskitRenderer.recordRenderFailure(error);
+      console.error(`[PageRenderer] CanvasKit 페이지 렌더링 실패 (page=${pageIdx}):`, error);
+      this.cancelReRender(pageIdx);
+      this.imageRetryCounts.delete(pageIdx);
+      return;
+    }
+    this.cancelReRender(pageIdx);
+    this.imageRetryCounts.delete(pageIdx);
   }
 
   /**
-   * Canvas 의 부모 컨테이너에 BehindText / InFrontOfText 그림을 <img> overlay 로 추가.
+   * Canvas 의 부모 컨테이너에 BehindText / InFrontOfText plane canvas 를 추가.
    *
-   * - BehindText: z-index 가 Canvas 뒤
-   * - InFrontOfText: z-index 가 Canvas 앞
-   * - mix-blend-mode 로 워터마크 효과 (multiply 등) 적용
-   * - pointer-events: none — hit-test 는 Canvas (텍스트) 가 받음
+   * - BehindText: flow Canvas 뒤
+   * - InFrontOfText: flow Canvas 앞
+   * - image/table/shape PaintOp 를 같은 PageLayerTree layer metadata 로 분류
+   * - pointer-events: none — hit-test 는 flow Canvas 가 받음
    */
-  private applyOverlays(pageIdx: number, canvas: HTMLCanvasElement, scale: number): void {
+  private applyOverlays(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+    dpr: number,
+    context: PageRenderContext,
+    layers: LayerPlaneSummary,
+    reuseStaticFlow: boolean,
+  ): LayerPlaneSummary {
     const parent = canvas.parentElement;
-    if (!parent) return;
+    if (!parent) return emptyLayerPlaneSummary();
 
-    // 페이지 단위 overlay 컨테이너를 Canvas 의 sibling 으로 관리.
-    // data-rhwp-overlay-page 속성으로 식별, 페이지 재렌더링 시 갱신.
-    const existingBehind = parent.querySelector(
-      `[data-rhwp-overlay="behind-${pageIdx}"]`,
-    ) as HTMLElement | null;
-    const existingFront = parent.querySelector(
-      `[data-rhwp-overlay="front-${pageIdx}"]`,
-    ) as HTMLElement | null;
-    if (existingBehind) existingBehind.remove();
-    if (existingFront) existingFront.remove();
+    const allowReuse =
+      context.reason === 'text-edit' && context.allowStaticOverlayReuse === true;
 
-    const { behind, front } = this.getOverlayImages(pageIdx);
-    // Task #516 Stage 5.2 진단 로그 — 시각 판정 통과 후 제거
-    console.log(`[Task#516] applyOverlays page=${pageIdx} behind=${behind.length} front=${front.length}`);
-    if (behind.length === 0 && front.length === 0) return;
+    if (!allowReuse) {
+      // 페이지 단위 overlay 컨테이너를 Canvas 의 sibling 으로 관리.
+      // data-rhwp-overlay-page 속성으로 식별, 페이지 재렌더링 시 갱신.
+      this.removePageLayers(parent, pageIdx);
+    }
 
-    // 위치/크기 정합용 공통 정보
-    const dpr = scale; // scale = zoom × DPR. CSS 표시 크기 = canvas / dpr
-    const cssWidth = canvas.width / dpr;
-    const cssHeight = canvas.height / dpr;
+    const safeDpr = dpr > 0 && Number.isFinite(dpr) ? dpr : 1;
+    const cssWidth = canvas.width / safeDpr;
+    const cssHeight = canvas.height / safeDpr;
     const top = canvas.style.top;
     const left = canvas.style.left;
     const transform = canvas.style.transform;
 
-    // BehindText overlay (Canvas 뒤)
-    if (behind.length > 0) {
-      const layer = this.createOverlayLayer(behind, cssWidth, cssHeight);
-      layer.dataset.rhwpOverlay = `behind-${pageIdx}`;
-      layer.style.position = 'absolute';
-      layer.style.top = top;
-      layer.style.left = left;
-      layer.style.transform = transform;
-      layer.style.width = `${cssWidth}px`;
-      layer.style.height = `${cssHeight}px`;
-      layer.style.pointerEvents = 'none';
-      layer.style.zIndex = '0';  // Canvas (z=auto) 보다 뒤
+    if (reuseStaticFlow) {
+      const flowStatic = this.createOrReuseFilteredCanvasLayer(
+        pageIdx,
+        canvas,
+        renderScale,
+        'flow-static',
+        layers,
+        allowReuse,
+      );
+      this.applyPageLayerBox(flowStatic, top, left, transform, cssWidth, cssHeight);
+      flowStatic.style.zIndex = '0';
+      parent.insertBefore(flowStatic, canvas);
+      canvas.style.background = 'transparent';
+      canvas.style.zIndex = layers.hasFront ? '1' : '1';
+    } else {
+      this.removeOverlayLayer(parent, pageIdx, 'flow-static');
+    }
+
+    if (!layers.hasBehind && !layers.hasFront) {
+      if (reuseStaticFlow) return layers;
+      this.removePageLayers(parent, pageIdx);
+      canvas.style.background = '';
+      canvas.style.zIndex = '';
+      return layers;
+    }
+
+    // BehindText 가 있는 페이지는 flow Canvas 를 투명 배경으로 두고,
+    // 실제 pageBackground layer → BehindText → flow Canvas 순서로 합성한다.
+    // Canvas 내부의 흰 배경은 WASM flow 렌더에서 생략된다.
+    if (layers.hasBehind) {
+      canvas.style.background = 'transparent';
+      canvas.style.zIndex = '2';
+
+      const background = this.createOrReuseFilteredCanvasLayer(
+        pageIdx,
+        canvas,
+        renderScale,
+        'background',
+        layers,
+        allowReuse,
+      );
+      this.applyPageLayerBox(background, top, left, transform, cssWidth, cssHeight);
+      background.style.zIndex = '0';
+      parent.insertBefore(background, canvas);
+    } else {
+      this.removeOverlayLayer(parent, pageIdx, 'background');
+      this.removeOverlayLayer(parent, pageIdx, 'behind');
+      canvas.style.background = reuseStaticFlow ? 'transparent' : '';
+      canvas.style.zIndex = layers.hasFront || reuseStaticFlow ? '1' : '';
+    }
+
+    // BehindText overlay (Canvas 뒤). 이미지뿐 아니라 표/도형 PaintOp도 포함한다.
+    if (layers.hasBehind) {
+      const layer = this.createOrReuseFilteredCanvasLayer(
+        pageIdx,
+        canvas,
+        renderScale,
+        'behind',
+        layers,
+        allowReuse,
+      );
+      this.applyPageLayerBox(layer, top, left, transform, cssWidth, cssHeight);
+      layer.style.zIndex = '1';
       // Canvas 보다 먼저 들어가도록 prepend
       parent.insertBefore(layer, canvas);
     }
 
-    // InFrontOfText overlay (Canvas 앞)
-    if (front.length > 0) {
-      const layer = this.createOverlayLayer(front, cssWidth, cssHeight);
-      layer.dataset.rhwpOverlay = `front-${pageIdx}`;
-      layer.style.position = 'absolute';
-      layer.style.top = top;
-      layer.style.left = left;
-      layer.style.transform = transform;
-      layer.style.width = `${cssWidth}px`;
-      layer.style.height = `${cssHeight}px`;
-      layer.style.pointerEvents = 'none';
-      layer.style.zIndex = '2';  // Canvas (z=auto) 보다 앞
+    // InFrontOfText overlay (Canvas 앞). 이미지뿐 아니라 글상자/도형 PaintOp도 포함한다.
+    if (layers.hasFront) {
+      const layer = this.createOrReuseFilteredCanvasLayer(
+        pageIdx,
+        canvas,
+        renderScale,
+        'front',
+        layers,
+        allowReuse,
+      );
+      this.applyPageLayerBox(layer, top, left, transform, cssWidth, cssHeight);
+      layer.style.zIndex = layers.hasBehind ? '3' : '2';  // Canvas 보다 앞
       parent.appendChild(layer);
+    } else {
+      this.removeOverlayLayer(parent, pageIdx, 'front');
     }
+    return layers;
   }
 
-  /** overlay 레이어 div 를 생성하고 그림 <img> 들을 추가 */
-  private createOverlayLayer(
-    images: OverlayImageInfo[],
+  private createOrReuseFilteredCanvasLayer(
+    pageIdx: number,
+    sourceCanvas: HTMLCanvasElement,
+    renderScale: number,
+    layerKind: StaticCanvasLayerKind,
+    summary: LayerPlaneSummary,
+    allowReuse: boolean,
+  ): HTMLCanvasElement {
+    const key = this.buildStaticOverlayKey(pageIdx, sourceCanvas, renderScale, layerKind, summary);
+    const reusableLayer = this.findOverlayLayer(sourceCanvas.parentElement, pageIdx, layerKind);
+    if (
+      allowReuse &&
+      reusableLayer?.dataset.rhwpStaticOverlayKey === key &&
+      reusableLayer.width === sourceCanvas.width &&
+      reusableLayer.height === sourceCanvas.height
+    ) {
+      return reusableLayer;
+    }
+
+    reusableLayer?.remove();
+    const layer = this.createFilteredCanvasLayer(pageIdx, sourceCanvas, renderScale, layerKind);
+    layer.dataset.rhwpOverlay = `${layerKind}-${pageIdx}`;
+    layer.dataset.rhwpOverlayPage = String(pageIdx);
+    layer.dataset.rhwpStaticOverlayKey = key;
+    return layer;
+  }
+
+  private createFilteredCanvasLayer(
+    pageIdx: number,
+    sourceCanvas: HTMLCanvasElement,
+    renderScale: number,
+    layerKind: StaticCanvasLayerKind,
+  ): HTMLCanvasElement {
+    const layer = document.createElement('canvas');
+    layer.width = sourceCanvas.width;
+    layer.height = sourceCanvas.height;
+    layer.dataset.rhwpLayerKind = layerKind;
+    layer.style.pointerEvents = 'none';
+    // Overlay canvas elements inherit #scroll-content canvas background unless
+    // this is explicit. A front layer with an opaque page background hides all
+    // lower background/behind layers.
+    layer.style.background = 'transparent';
+    this.wasm.renderPageToCanvasFiltered(pageIdx, layer, renderScale, layerKind);
+    return layer;
+  }
+
+  private applyPageLayerBox(
+    layer: HTMLElement,
+    top: string,
+    left: string,
+    transform: string,
     cssWidth: number,
     cssHeight: number,
-  ): HTMLDivElement {
-    const layer = document.createElement('div');
-    for (const img of images) {
-      const el = document.createElement('img');
-      el.src = `data:${img.mime};base64,${img.base64}`;
-      el.style.position = 'absolute';
-      // bbox 는 페이지 좌표계 (CSS px 기준), Canvas 와 동일 좌표계.
-      el.style.left = `${img.bbox.x}px`;
-      el.style.top = `${img.bbox.y}px`;
-      el.style.width = `${img.bbox.width}px`;
-      el.style.height = `${img.bbox.height}px`;
-      el.style.pointerEvents = 'none';
-      // CSS filter (그림 효과 + 밝기 + 대비)
-      const filterParts: string[] = [];
-      if (img.effect === 'grayScale' || img.effect === 'pattern8x8') {
-        filterParts.push('grayscale(100%)');
-      } else if (img.effect === 'blackWhite') {
-        filterParts.push('grayscale(100%)');
-        filterParts.push('contrast(1000%)');
-      }
-      if (img.brightness !== 0) {
-        filterParts.push(`brightness(${(100 + img.brightness) / 100})`);
-      }
-      if (img.contrast !== 0) {
-        filterParts.push(`contrast(${(100 + img.contrast) / 100})`);
-      }
-      if (filterParts.length > 0) {
-        el.style.filter = filterParts.join(' ');
-      }
-      // 워터마크는 multiply blend (흰색 배경 = 투명 효과, 텍스트 위 자연 합성).
-      // 회색조 처리 + 투명도 조절의 정합한 시각은 별도 task 로 분리 처리.
-      if (img.watermark) {
-        el.style.mixBlendMode = 'multiply';
-      }
-      // transform (회전/플립) — 작업 우선순위 낮음, 본 사이클은 미적용
-      void cssWidth; void cssHeight;
-      layer.appendChild(el);
-    }
-    return layer;
+  ): void {
+    layer.style.position = 'absolute';
+    layer.style.top = top;
+    layer.style.left = left;
+    layer.style.transform = transform;
+    layer.style.width = `${cssWidth}px`;
+    layer.style.height = `${cssHeight}px`;
+    layer.style.overflow = 'hidden';
+    layer.style.pointerEvents = 'none';
+  }
+
+  removePageLayers(parent: HTMLElement, pageIdx: number): void {
+    this.layerSummaryCache.delete(pageIdx);
+    parent.querySelectorAll(
+      `[data-rhwp-overlay-page="${pageIdx}"],` +
+      `[data-rhwp-overlay="background-${pageIdx}"],` +
+      `[data-rhwp-overlay="behind-${pageIdx}"],` +
+      `[data-rhwp-overlay="front-${pageIdx}"]`,
+    ).forEach((el) => el.remove());
+  }
+
+  private findOverlayLayer(
+    parent: HTMLElement | null,
+    pageIdx: number,
+    layerKind: StaticCanvasLayerKind,
+  ): HTMLCanvasElement | null {
+    return parent?.querySelector<HTMLCanvasElement>(
+      `[data-rhwp-overlay-page="${pageIdx}"][data-rhwp-layer-kind="${layerKind}"]`,
+    ) ?? null;
+  }
+
+  private removeOverlayLayer(parent: HTMLElement, pageIdx: number, layerKind: StaticCanvasLayerKind): void {
+    this.findOverlayLayer(parent, pageIdx, layerKind)?.remove();
+  }
+
+  private buildStaticOverlayKey(
+    pageIdx: number,
+    sourceCanvas: HTMLCanvasElement,
+    renderScale: number,
+    layerKind: StaticCanvasLayerKind,
+    summary: LayerPlaneSummary,
+  ): string {
+    return [
+      `page=${pageIdx}`,
+      `scale=${renderScale}`,
+      `width=${sourceCanvas.width}`,
+      `height=${sourceCanvas.height}`,
+      `layer=${layerKind}`,
+      `profile=${this.renderProfile}`,
+      `backend=${this.backend}`,
+      `summary=${summary.signature}`,
+    ].join('|');
+  }
+
+  removeAllPageLayers(parent: HTMLElement): void {
+    this.layerSummaryCache.clear();
+    parent.querySelectorAll(
+      '[data-rhwp-overlay-page],' +
+      '[data-rhwp-overlay^="background-"],' +
+      '[data-rhwp-overlay^="behind-"],' +
+      '[data-rhwp-overlay^="front-"]',
+    ).forEach((el) => el.remove());
   }
 
   /**
    * 페이지를 본문 layer (flow) 만 Canvas 에 렌더링한다 (Task #516, Stage 5.2).
-   * BehindText / InFrontOfText 그림은 제외 — overlay 로 별도 표시.
+   * BehindText / InFrontOfText plane 은 제외 — overlay canvas 로 별도 표시.
    */
   renderPageFlow(pageIdx: number, canvas: HTMLCanvasElement, scale: number): void {
     this.wasm.renderPageToCanvasFiltered(pageIdx, canvas, scale, 'flow');
     this.drawMarginGuides(pageIdx, canvas, scale);
-    this.scheduleReRender(pageIdx, canvas, scale);
+    this.scheduleReRender(pageIdx, canvas, scale, 0, {
+      retrySignature: 'flow-only',
+      reuseStaticFlow: false,
+      reuseStaticOverlay: false,
+    });
   }
 
-  /**
-   * 페이지의 BehindText / InFrontOfText 그림 overlay 정보를 추출한다 (Task #516, Stage 5.2).
-   * PageLayerTree JSON 을 파싱하여 wrap = behindText / inFrontOfText 인 image op 만 반환.
-   */
-  getOverlayImages(pageIdx: number): { behind: OverlayImageInfo[]; front: OverlayImageInfo[] } {
-    const json = this.wasm.getPageLayerTree(pageIdx);
-    const behind: OverlayImageInfo[] = [];
-    const front: OverlayImageInfo[] = [];
-    // Task #516 진단 로그 (시각 판정 통과 후 제거)
-    const imageOpCount = (json.match(/"type":"image"/g) || []).length;
-    const wrapBehindCount = (json.match(/"wrap":"behindText"/g) || []).length;
-    console.log(`[Task#516] JSON image ops=${imageOpCount}, wrap=behindText=${wrapBehindCount}`);
+  private shouldUseStaticFlowReuse(context: PageRenderContext, layers: LayerPlaneSummary): boolean {
+    return (
+      context.reason === 'text-edit' &&
+      context.allowStaticOverlayReuse === true &&
+      !layers.hasBehind &&
+      layers.flowStaticCount > 0 &&
+      this.flowSplitSupported !== false
+    );
+  }
+
+  private renderFlowCanvas(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+    preferStaticFlow: boolean,
+  ): boolean {
+    if (!preferStaticFlow) {
+      this.wasm.renderPageToCanvasFiltered(pageIdx, canvas, renderScale, 'flow');
+      return false;
+    }
+    try {
+      this.wasm.renderPageToCanvasFiltered(pageIdx, canvas, renderScale, 'flow-dynamic');
+      this.flowSplitSupported = true;
+      return true;
+    } catch (error) {
+      this.flowSplitSupported = false;
+      console.warn('[PageRenderer] flow-dynamic 렌더 미지원, 기존 flow 렌더로 fallback:', error);
+      this.wasm.renderPageToCanvasFiltered(pageIdx, canvas, renderScale, 'flow');
+      return false;
+    }
+  }
+
+  private getLayerPlaneSummary(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+    context: PageRenderContext,
+  ): LayerPlaneSummary {
+    const cacheKey = this.buildLayerSummaryCacheKey(pageIdx, canvas, renderScale);
+    if (context.reason === 'text-edit' && context.allowStaticOverlayReuse === true) {
+      const cached = this.layerSummaryCache.get(pageIdx);
+      if (cached?.key === cacheKey) return { ...cached.summary };
+    }
+
+    const overlaySummary = this.getLayerPlaneSummaryFromOverlayImages(pageIdx);
+    if (overlaySummary) {
+      this.layerSummaryCache.set(pageIdx, { key: cacheKey, summary: overlaySummary });
+      return overlaySummary;
+    }
+    const treeSummary = this.getLayerPlaneSummaryFromTree(pageIdx);
+    this.layerSummaryCache.set(pageIdx, { key: cacheKey, summary: treeSummary });
+    return treeSummary;
+  }
+
+  private rememberLayerPlaneSummary(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+    summary: LayerPlaneSummary,
+  ): void {
+    this.layerSummaryCache.set(pageIdx, {
+      key: this.buildLayerSummaryCacheKey(pageIdx, canvas, renderScale),
+      summary: { ...summary },
+    });
+  }
+
+  private buildLayerSummaryCacheKey(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+  ): string {
+    return [
+      `page=${pageIdx}`,
+      `scale=${renderScale}`,
+      `width=${canvas.width}`,
+      `height=${canvas.height}`,
+      `profile=${this.renderProfile}`,
+      `backend=${this.backend}`,
+    ].join('|');
+  }
+
+  private getLayerPlaneSummaryFromOverlayImages(pageIdx: number): LayerPlaneSummary | null {
+    let json: string;
+    try {
+      json = this.wasm.getPageOverlayImages(pageIdx);
+    } catch {
+      return null;
+    }
+    if (!json || json.trim()[0] !== '{') return null;
     try {
       const wrapper = JSON.parse(json);
-      // PageLayerTree JSON 의 트리는 wrapper.root 안에 있음.
-      // wrapper = { schemaVersion, pageWidth, pageHeight, root: { kind, ... } }
+      if (typeof wrapper?.hasBehind !== 'boolean' || typeof wrapper?.hasFront !== 'boolean') {
+        return null;
+      }
+      const behind = Array.isArray(wrapper.behind) ? wrapper.behind : [];
+      const front = Array.isArray(wrapper.front) ? wrapper.front : [];
+      const imageCount = finiteCount(wrapper.imageCount);
+      const rawSvgCount = finiteCount(wrapper.rawSvgCount);
+      const flowImageCount =
+        wrapper.flowImageCount === undefined
+          ? Math.max(0, imageCount - behind.length - front.length)
+          : finiteCount(wrapper.flowImageCount);
+      const flowRawSvgCount =
+        wrapper.flowRawSvgCount === undefined
+          ? rawSvgCount
+          : finiteCount(wrapper.flowRawSvgCount);
+      const flowStaticCount = flowImageCount + flowRawSvgCount;
+      return {
+        hasBehind: wrapper.hasBehind,
+        hasFront: wrapper.hasFront,
+        imageCount,
+        rawSvgCount,
+        flowImageCount,
+        flowRawSvgCount,
+        flowStaticCount,
+        signature: `overlay:${wrapper.hasBehind ? 1 : 0}:${wrapper.hasFront ? 1 : 0}:${imageCount}:${rawSvgCount}:${flowImageCount}:${flowRawSvgCount}:${json.length}`,
+      };
+    } catch (e) {
+      console.warn('[PageRenderer] OverlayImageSummary JSON parse 실패:', e);
+      return null;
+    }
+  }
+
+  private getLayerPlaneSummaryFromTree(pageIdx: number): LayerPlaneSummary {
+    const summary: LayerPlaneSummary = emptyLayerPlaneSummary();
+    let json: string;
+    try {
+      json = this.wasm.getPageLayerTree(pageIdx);
+    } catch (e) {
+      console.warn('[PageRenderer] PageLayerTree JSON 조회 실패:', e);
+      return summary;
+    }
+    try {
+      const wrapper = JSON.parse(json);
       const root = wrapper?.root;
       if (root) {
-        collectOverlayImages(root, behind, front);
+        collectLayerPlaneSummary(root, summary, null);
+        summary.flowStaticCount = summary.flowImageCount + summary.flowRawSvgCount;
+        summary.signature = `tree:${summary.hasBehind ? 1 : 0}:${summary.hasFront ? 1 : 0}:${summary.imageCount}:${summary.rawSvgCount}:${summary.flowImageCount}:${summary.flowRawSvgCount}`;
       }
     } catch (e) {
       console.warn('[PageRenderer] PageLayerTree JSON parse 실패:', e);
     }
-    console.log(`[Task#516] collected behind=${behind.length} front=${front.length}`);
-    return { behind, front };
+    return summary;
   }
 
   /** 편집 용지 여백 가이드라인을 캔버스에 그린다 (4모서리 L자 표시) */
@@ -232,24 +585,147 @@ export class PageRenderer {
   /**
    * 비동기 이미지 로드 대응: data URL 이미지가 첫 렌더링 시
    * 아직 디코딩되지 않았을 수 있으므로 점진적 재렌더링한다.
-   * 200ms, 600ms 두 번 재시도하여 대부분의 이미지 로드를 커버한다.
+   *
+   * 작은 이미지 (헤더 라벨 등) 는 200/600ms 안에 디코드되지만, 큰 PNG/JPEG
+   * (수십 KB~수백 KB) 는 디코드가 1초 이상 걸릴 수 있어 한 번 더 시도하고
+   * (Task #1154), 그래도 누락이면 마지막에 자체 prefetch로 강제 디코드한다.
    */
-  private scheduleReRender(pageIdx: number, canvas: HTMLCanvasElement, scale: number): void {
-    this.cancelReRender(pageIdx);
+  private scheduleReRender(
+    pageIdx: number,
+    canvas: HTMLCanvasElement,
+    renderScale: number,
+    imageCount: number,
+    policy: ReRenderPolicy,
+  ): void {
+    if (imageCount <= 0) {
+      this.cancelReRender(pageIdx);
+      this.imageRetryCounts.delete(pageIdx);
+      return;
+    }
+    const retryKey = `${imageCount}:${policy.retrySignature}`;
+    if (this.imageRetryCounts.get(pageIdx) === retryKey) return;
 
-    const delays = [200, 600];
+    this.cancelReRender(pageIdx);
+    this.imageRetryCounts.set(pageIdx, retryKey);
+
+    const delays = [200, 600, 1500];
     const timers: ReturnType<typeof setTimeout>[] = [];
 
     for (const delay of delays) {
       const timer = setTimeout(() => {
         if (canvas.parentElement) {
-          this.wasm.renderPageToCanvas(pageIdx, canvas, scale);
-          this.drawMarginGuides(pageIdx, canvas, scale);
+          this.reRenderPageCanvases(pageIdx, canvas, renderScale, policy);
         }
       }, delay);
       timers.push(timer);
     }
+
+    // 안전망: 1500ms 시점에서도 큰 이미지가 디코드 안 끝났을 수 있으므로,
+    // 페이지의 image base64 들을 자체 prefetch (Image.decode()) 한 후
+    // 모두 완료되면 한 번 더 렌더링한다. setTimeout 과 별개로 동작.
+    queueMicrotask(() => {
+      this.prefetchLayerImages(pageIdx)
+        .then(() => {
+          if (canvas.parentElement) {
+            this.reRenderPageCanvases(pageIdx, canvas, renderScale, policy);
+          }
+        })
+        .catch(() => {});
+    });
+
     this.reRenderTimers.set(pageIdx, timers);
+  }
+
+  private reRenderPageCanvases(
+    pageIdx: number,
+    flowCanvas: HTMLCanvasElement,
+    renderScale: number,
+    policy: ReRenderPolicy,
+  ): void {
+    const parent = flowCanvas.parentElement;
+    if (!parent) return;
+
+    let renderedStaticFlow = false;
+    if (policy.reuseStaticFlow) {
+      const flowStatic = this.findOverlayLayer(parent, pageIdx, 'flow-static');
+      if (flowStatic) {
+        flowStatic.width = flowCanvas.width;
+        flowStatic.height = flowCanvas.height;
+        try {
+          this.wasm.renderPageToCanvasFiltered(pageIdx, flowStatic, renderScale, 'flow-static');
+          renderedStaticFlow = true;
+        } catch (error) {
+          this.flowSplitSupported = false;
+          flowStatic.remove();
+          console.warn('[PageRenderer] flow-static 지연 재렌더 실패, 기존 flow 재렌더로 fallback:', error);
+        }
+      }
+    }
+
+    if (!renderedStaticFlow) {
+      this.wasm.renderPageToCanvasFiltered(pageIdx, flowCanvas, renderScale, 'flow');
+      this.drawMarginGuides(pageIdx, flowCanvas, renderScale);
+    }
+
+    if (policy.reuseStaticOverlay) return;
+
+    parent.querySelectorAll<HTMLCanvasElement>(
+      `[data-rhwp-overlay-page="${pageIdx}"][data-rhwp-layer-kind]`,
+    ).forEach((layerCanvas) => {
+      const kind = layerCanvas.dataset.rhwpLayerKind;
+      if (kind === 'background' || kind === 'behind' || kind === 'front') {
+        layerCanvas.width = flowCanvas.width;
+        layerCanvas.height = flowCanvas.height;
+        this.wasm.renderPageToCanvasFiltered(pageIdx, layerCanvas, renderScale, kind);
+      }
+    });
+  }
+
+  /**
+   * 페이지의 image base64 데이터를
+   * 자체 prefetch 하여 모든 이미지가 브라우저에 디코드 완료될 때까지 대기.
+   * Task #1154 — IMAGE_CACHE 의 비동기 디코드 누락 안전망.
+   */
+  private async prefetchLayerImages(pageIdx: number): Promise<void> {
+    let json: string;
+    try {
+      json = this.wasm.getPageLayerTree(pageIdx);
+    } catch {
+      return;
+    }
+    const tasks: Promise<unknown>[] = [];
+    const seen = new Set<string>();
+    const enqueue = (dataUrl: string) => {
+      if (seen.has(dataUrl)) return;
+      seen.add(dataUrl);
+      tasks.push(
+        new Promise<void>((resolve) => {
+          const img = new Image();
+          img.onload = () => resolve();
+          img.onerror = () => resolve();
+          img.src = dataUrl;
+          // decode() 이 더 정확하지만 일부 브라우저 미지원
+          if (typeof img.decode === 'function') {
+            img.decode().then(() => resolve()).catch(() => resolve());
+          }
+        }),
+      );
+    };
+    // image 항목들의 mime + base64 추출 (간단한 정규식)
+    const re = /"type":"image"[^}]*?(?:"wrap":"(behindText|inFrontOfText)")?[^}]*?"mime":"([^"]+)","base64":"([^"]+)"/g;
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(json)) !== null) {
+      enqueue(`data:${m[2]};base64,${m[3]}`);
+    }
+    // rawSvg 항목 (OLE/차트 미리보기) 의 embedded data URL 추출.
+    // svg 필드는 JSON 인코딩 문자열이며 내부에 data:image/MIME;base64,... 가 등장한다.
+    // rawSvg 의 wrap 은 항상 flow 이므로 overlay 필터링 불필요.
+    const dataUrlRe = /data:(image\/[A-Za-z0-9.+-]+);base64,([A-Za-z0-9+/=]+)/g;
+    let d: RegExpExecArray | null;
+    while ((d = dataUrlRe.exec(json)) !== null) {
+      enqueue(`data:${d[1]};base64,${d[2]}`);
+    }
+    await Promise.all(tasks);
   }
 
   /** 특정 페이지의 지연 재렌더링을 취소한다 */
@@ -268,50 +744,92 @@ export class PageRenderer {
     }
     this.reRenderTimers.clear();
   }
+
+  resetImageRetryState(): void {
+    this.imageRetryCounts.clear();
+    this.layerSummaryCache.clear();
+  }
+
+  dispose(): void {
+    this.cancelAll();
+    this.layerSummaryCache.clear();
+    this.canvaskitRenderer?.dispose();
+    this.canvaskitRenderer = null;
+  }
 }
 
-/**
- * PageLayerTree JSON 트리를 재귀 순회하며 overlay 후보 image op 수집 (Task #516).
- * BehindText / InFrontOfText 그림만 분리. 본문 layer 의 image (어울림/위아래/None) 는 무시.
- */
-function collectOverlayImages(
+function emptyLayerPlaneSummary(): LayerPlaneSummary {
+  return {
+    hasBehind: false,
+    hasFront: false,
+    imageCount: 0,
+    rawSvgCount: 0,
+    flowImageCount: 0,
+    flowRawSvgCount: 0,
+    flowStaticCount: 0,
+    signature: 'empty',
+  };
+}
+
+function finiteCount(value: unknown): number {
+  const n = Number(value);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 0;
+}
+
+function collectLayerPlaneSummary(
   node: any,
-  behind: OverlayImageInfo[],
-  front: OverlayImageInfo[],
+  summary: LayerPlaneSummary,
+  inheritedLayer: any,
 ): void {
   if (!node || typeof node !== 'object') return;
-  // ops 배열 (Leaf 노드)
+  const activeLayer = node.layer ?? inheritedLayer;
   if (Array.isArray(node.ops)) {
     for (const op of node.ops) {
-      if (op?.type !== 'image') continue;
-      if (op.wrap === 'behindText') {
-        behind.push(toOverlayInfo(op, 'behindText'));
-      } else if (op.wrap === 'inFrontOfText') {
-        front.push(toOverlayInfo(op, 'inFrontOfText'));
+      if (!op || typeof op !== 'object') continue;
+      const plane = layerReplayPlane(op, activeLayer);
+      if (op.type === 'image') {
+        summary.imageCount += 1;
+        if (plane === 'flow') {
+          summary.flowImageCount += 1;
+        }
+      } else if (op.type === 'rawSvg') {
+        // 차트/OLE 미리보기. web_canvas draw_image 비동기 디코드 경로를 타므로
+        // image 와 동일하게 재렌더 트리거 대상에 포함한다(#1456).
+        summary.rawSvgCount += 1;
+        if (plane === 'flow') {
+          summary.flowRawSvgCount += 1;
+        }
+      }
+      if (plane === 'behindText') {
+        summary.hasBehind = true;
+      } else if (plane === 'inFrontOfText') {
+        summary.hasFront = true;
       }
     }
   }
-  // children (Group/ClipRect)
   if (Array.isArray(node.children)) {
     for (const child of node.children) {
-      collectOverlayImages(child, behind, front);
+      collectLayerPlaneSummary(child, summary, activeLayer);
     }
   }
   if (node.child) {
-    collectOverlayImages(node.child, behind, front);
+    collectLayerPlaneSummary(node.child, summary, activeLayer);
   }
 }
 
-function toOverlayInfo(op: any, wrap: 'behindText' | 'inFrontOfText'): OverlayImageInfo {
-  return {
-    bbox: op.bbox,
-    mime: op.mime ?? 'application/octet-stream',
-    base64: op.base64 ?? '',
-    effect: op.effect ?? 'realPic',
-    brightness: op.brightness ?? 0,
-    contrast: op.contrast ?? 0,
-    watermark: op.watermark,
-    wrap,
-    transform: op.transform,
-  };
+function layerReplayPlane(op: any, layer: any): 'background' | 'behindText' | 'flow' | 'inFrontOfText' {
+  if (op?.type === 'pageBackground') {
+    return 'background';
+  }
+  if (layer?.textWrap === 'behindText') {
+    return 'behindText';
+  }
+  if (layer?.textWrap === 'inFrontOfText') {
+    return 'inFrontOfText';
+  }
+  if (op?.type === 'image') {
+    if (op.wrap === 'behindText') return 'behindText';
+    if (op.wrap === 'inFrontOfText') return 'inFrontOfText';
+  }
+  return 'flow';
 }

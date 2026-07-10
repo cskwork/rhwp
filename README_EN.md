@@ -15,13 +15,8 @@
   <a href="https://www.npmjs.com/package/@rhwp/core"><img src="https://img.shields.io/npm/v/@rhwp/core?label=npm" alt="npm" /></a>
   <a href="https://marketplace.visualstudio.com/items?itemName=edwardkim.rhwp-vscode"><img src="https://img.shields.io/badge/VS%20Code-Marketplace-007ACC" alt="VS Code" /></a>
   <a href="https://opensource.org/licenses/MIT"><img src="https://img.shields.io/badge/License-MIT-yellow.svg" alt="License: MIT" /></a>
-  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.75%2B-orange.svg" alt="Rust" /></a>
+  <a href="https://www.rust-lang.org/"><img src="https://img.shields.io/badge/Rust-1.93.1-orange.svg" alt="Rust" /></a>
   <a href="https://webassembly.org/"><img src="https://img.shields.io/badge/WebAssembly-Ready-blue.svg" alt="WASM" /></a>
-</p>
-
-<p align="center">
-  <a href="https://oosmetrics.com/repo/edwardkim/rhwp"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/921c34bc-4dd3-4409-ba2e-2d99c8b4a9b6.svg" alt="Top 2 in WebAssembly by originality - 2026-04-21" /></a>
-  <a href="https://oosmetrics.com/repo/edwardkim/rhwp"><img src="https://api.oosmetrics.com/api/v1/badge/achievement/fd1e3217-b99a-4ec2-8cba-98429f3d91c7.svg" alt="Top 2 in Editors by originality - 2026-04-21" /></a>
 </p>
 
 <p align="center">
@@ -30,7 +25,7 @@
 
 ---
 
-Open **HWP files anywhere**. Free, no installation required.
+Open **HWP/HWPX files anywhere**. Free, no installation required.
 
 **HWP** is the dominant document format in South Korea — used by government agencies, schools, courts, and most organizations. Until now, there has been no viable open-source solution to read or edit these files.
 
@@ -70,6 +65,160 @@ Foundation  Typeset   Collab    Complete
 - SVG export (CLI) + Canvas rendering (WASM/Web)
 - Web editor + hwpctl-compatible API (30 Actions, Field API)
 - 1,100+ tests
+
+#### v0.7.18 Cycle (2026-07-11)
+
+> Patch after v0.7.17 — large-scale rendering fidelity (floating/front objects, RowBreak
+> tables, page-bottom trust), huge-table performance, editor caret/undo/OLE parity,
+> lenient parsing & HWPX preservation, WMF shape rewrite
+
+**Rendering fidelity**
+- Floating/front object pagination parity with Hangul (#1994/#1995/#2004/#2006/#2007/#2019)
+- RowBreak table corrections (#1921/#1937/#1842/#2097) + page-bottom saved-bounds trust (#2093)
+
+**Performance · Editor**
+- Huge-table render timeout resolved — 52,694 cells (#2063); late-page caret 3,064ms→33ms (#2021)
+
+**Parser · Serialization · Shapes**
+- Lenient loading of partially corrupted documents (#1932), HWPX preservation, WMF rewrite (#1943)
+
+#### v0.7.17 Cycle (2026-06-23)
+
+> Patch after v0.7.16 — first OOXML chart render-fidelity work, legacy-shape shapeComment
+> serialization, WASM options-object APIs, rhwp-studio table/picture/cursor editing fixes,
+> and a dependency bump batch
+
+**Rendering · charts**
+- 2D-approximation routing for 7 OOXML chart types (3D-bar/3D-pie/ofPie) + bar stacking/percent (C1a)
+- Keep v2 font authority on fallback, expand CanvasKit replay contract guards
+
+**Save contract · API**
+- Fixed missing shapeComment serialization on legacy shapes (ellipse/arc/polygon/curve/chart/ole)
+- Added 26 WASM options-object APIs (`*Ex`, backward-compatible) + consumer README/manual
+
+**rhwp-studio · extension**
+- Table row/column insert-delete regression fix, autosave/recovery, local-font consent, picture/cursor fidelity, table-cell editing/protection
+- Browser extension 0.2.6: viewer CSP fix, Chrome download interceptor side-effect removal
+
+#### v0.7.16 Cycle (2026-06-19)
+
+> Patch after v0.7.15 — HWPX save-contract (serializer fidelity) refinements, ClickHere
+> guide-text Hancom compatibility, rhwp-studio drag-and-drop security gate, and rendering/
+> table/picture fixes with many external contributor PRs
+
+**HWPX Save Contract (serializer fidelity)**
+- Preserved cell/text-box controls, linesegs, and captions; emit secPr margins and body
+  column (colPr) from the IR instead of template hardcoding
+- Preserved picture sizes, MEMO, shapeComment, registration axis, table pageBreak; lossless
+  roundtrip for DocInfo/numbering and more
+- Made parser autoNum width consistent, fixed newNum slot position, added enum-token surface check
+
+**Hancom Compatibility · rhwp-studio**
+- Fixed ClickHere (click-to-type) guide-text command format — resolves guide text not binding
+  in the Hancom editor
+- Drag-and-drop local file loading security gate (modal opt-in, extension/web common); ClickHere
+  editing and dark theme
+
+**Rendering · Other**
+- Native PDF export API, Text IR v2 font-proof gates, endnote height SSOT, rotated-cell picture placement
+- 27-sample chart corpus verification fixture; preserve mixed page sizes when printing
+
+#### v0.7.15 Cycle (2026-06-06)
+
+> Security patch — browser-extension service-worker fetch hardening, equation TAC flow/caret fixes,
+> HWPX save-contract follow-ups, and browser extension v0.2.4 preparation
+
+**Browser Extension Security**
+- Hardened Chrome/Firefox service-worker document-fetch sender validation, internal/localhost/private URL blocking, and final redirect URL revalidation
+- Uses `credentials: "omit"` for extension-side fetches and keeps automatically extracted thumbnail data out of the page DOM
+- Chrome/Edge/Firefox extension v0.2.4: no new permissions and no new external network endpoints
+
+**Equation and Endnote Flow**
+- Improved wrapping and paragraph-indent handling for equation TAC-only lines
+- Fixed caret movement across forced line breaks, equation TACs, endnote areas, and paragraph boundaries
+
+**HWPX Save Contract**
+- Fixed HWPX picture serialization for flip/rotation and `isEmbeded`
+- Preserved HWPX diagonal cell-border `hh:slash` / `hh:backSlash` type values
+- Preserved zero-length HWPX field ordering
+
+#### v0.7.13 Cycle (2026-05-18 ~ 2026-05-26)
+
+> Focused HWPX rendering/save compatibility fixes, exam/public-agency document regression fixes, and browser extension v0.2.3 preparation
+
+**HWPX → HWP Save Compatibility**
+- Improved table/cell axis contracts, cell LIST_HEADER materialization, gradient `BORDER_FILL`, cell inner margins, and cell background image fill mode serialization
+- Implemented memo control serialization, memo style preservation, TOC field marker/page text output, page-number hide/restart controls, and related paragraph-control save paths
+- Resolved multiple Hancom corruption/interrupted-render cases across `hwpx-h-01/02/03`, `mel-001`, `aift`, `exam_kor`, and `exam_social` fixtures
+
+**HWPX Rendering Parity**
+- Improved master pages (even/odd/last), headers/footers, paragraph numbering, paragraph borders, and exam passage boxes
+- Improved textbox positioning, gradient fills, and rounded-corner rendering
+- Improved SVG and web-canvas visual parity against Hancom-converted fixtures including `exam_kor.hwpx`, `exam_social.hwpx`, and `hwp3-sample16-hwp5.hwpx`
+
+**Pagination and Layout Fixes**
+- Fixed HWPX `treat_as_char` table LINE_SEG height over-inflation, nested table page splitting, picture pushdown/vpos double counting, and multi-column endnote vpos handling
+- Improved caret movement around TAC shapes and repeated spaces
+
+**Release and Extensions**
+- Published `@rhwp/core` / `@rhwp/editor` v0.7.13 to npm
+- Attached Linux/macOS/Windows CLI binaries and SHA-256 checksums to GitHub Release `v0.7.13`
+- rhwp Chrome / Edge / Firefox extension v0.2.3 bundles rhwp core 0.7.13 WASM, adds local `file://` access guidance, and suppresses duplicate local-file downloads on Chrome/Edge
+
+#### v0.7.12 Cycle (2026-05-12 ~ 2026-05-18)
+
+> Patch cycle after v0.7.11 — 19 external contributor PRs plus the 7-PR @jangster77 series
+
+**Core Regression Fixes**
+- Split original Issue #952 into five focused defects and completed them: page-border basis, empty-caption phantom advance, column-relative picture advance, inline TAC line mapping before line breaks, and duplicate inline-equation emission inside textboxes
+- Fixed WMF `SetTextAlign` vertical-bit interpretation and HWP3 empty-paragraph + page-break overflow page-count inflation
+- Enabled release LTO / `codegen-units=1` / strip to reduce CLI and WASM artifact size
+
+**rhwp-studio and APIs**
+- Added F5 body block selection, F3 range extension, menu hotkey infrastructure, and page-number restart UI/API support
+- Added `searchAllText`, `rhwpDev.goto()`, and the first document compare/history workflow
+- Improved editing reliability around unsaved-change protection, external clipboard paste priority, and nested-table hit testing
+
+**HWP3/WMF/EMF/Layout**
+- Improved EMF/WMF image rendering, HWP3 tab-spec handling, and HWP3/HWPX external image references
+- Fixed multiple regressions around header/footer picture rotation and mirroring, master-page table margins, equation Canvas/WASM rendering, and final-column flow
+
+**Contributor Thanks**
+- Contributors in this cycle: [@jangster77](https://github.com/jangster77), [@oksure](https://github.com/oksure), [@planet6897](https://github.com/planet6897), [@seo-rii](https://github.com/seo-rii), [@postmelee](https://github.com/postmelee), [@johndoekim](https://github.com/johndoekim), [@ubermensch1218](https://github.com/ubermensch1218), [@xogh3198](https://github.com/xogh3198), [@dragonnite1221-lgtm](https://github.com/dragonnite1221-lgtm)
+
+#### v0.7.11 Cycle (2026-05-10 ~ 2026-05-11)
+
+> Patch cycle after v0.7.10 — focused on Skia native raster, HWP3 native rendering, and rhwp-studio editing interactions
+
+**Rendering and Layout**
+- Advanced Skia native raster work for Issue #536: Layer IR contract hardening, text replay parity, and Text IR v2 compatibility contract
+- Improved HWP3 native rendering through staged fixes against the 763-page `hwp3-sample10.hwp` oracle
+- Organized Git LFS `pdf-large/` isolation and large-fixture handling
+
+**rhwp-studio Editing UX**
+- Improved scrollbar dragging, Korean IME chord-key detection, and the `Ctrl+N → Ctrl+M` shortcut adjustment to avoid Chrome-reserved shortcuts
+- Fixed Alt/Option+Arrow word navigation, table-cell context preservation during drag selection, and line/document-end caret movement
+- Added table-edit Undo/Redo, table-resize `SnapshotCommand`, multi-column/new-number dialogs, and Ctrl/Cmd+Arrow / Ctrl+E shortcuts
+
+**Contributor Thanks**
+- Contributors in this cycle: [@planet6897](https://github.com/planet6897), [@oksure](https://github.com/oksure), [@jangster77](https://github.com/jangster77), [@seo-rii](https://github.com/seo-rii), [@postmelee](https://github.com/postmelee), [@johndoekim](https://github.com/johndoekim), [@kihyunnn](https://github.com/kihyunnn)
+
+#### v0.7.10 Cycle (2026-05-06)
+
+> Patch cycle after v0.7.9 — absorbed 7 external contributors, introduced the AI/VLM PNG pipeline, and added the CLI binary release pipeline
+
+**New Features and Infrastructure**
+- Added the GitHub Release pipeline for Linux/macOS/Windows CLI binaries with SHA-256 checksums
+- Added native Skia `PageLayerTree → PNG` export, the `native-skia` feature gate, and `DocumentCore::render_page_png_native(page)`
+- Added the `export-png` CLI, `--vlm-target claude`, `--scale`, `--max-dimension`, `--font-path`, plus Korean/English manuals
+
+**Layout and Rendering Fixes**
+- Fixed HWP3 Square wrap cases, HWP3 conversion-identification heuristics, and the HWP 5.0 spec 0x18/0x1E swap
+- Fixed cell inline TAC Shape margin + indent, TAC table `outer_margin_bottom`, inline table + equation paragraph shifts, choice-cell fraction paragraph routing, and cell-internal TopAndBottom image 1-line offsets
+- Fixed PUA SVG output, exam_eng arrow glyph mapping, Square wrap table `horz_rel_to=Column`, and missing inline equation rendering
+
+**Contributor Thanks**
+- Contributors in this cycle: [@planet6897](https://github.com/planet6897), [@oksure](https://github.com/oksure), [@jangster77](https://github.com/jangster77), [@seo-rii](https://github.com/seo-rii), [@postmelee](https://github.com/postmelee), [@johndoekim](https://github.com/johndoekim), [@cskwork](https://github.com/cskwork)
 
 #### v0.7.9 Cycle (2026-05-01)
 
@@ -129,7 +278,7 @@ Foundation  Typeset   Collab    Complete
 - Content-script `init()` gate split to honor hoverPreview / autoOpen independently from showBadges (external contribution by [@postmelee](https://github.com/postmelee) — PR [#224](https://github.com/edwardkim/rhwp/pull/224))
 
 **Thanks to contributors**
-v0.7.x cycle cumulative external contributors: [@ahnbu](https://github.com/ahnbu), [@bapdodi](https://github.com/bapdodi), [@cskwork](https://github.com/cskwork), [@DanMeon](https://github.com/DanMeon), [@dreamworker0](https://github.com/dreamworker0), [@marsimon](https://github.com/marsimon), [@oksure](https://github.com/oksure), [@planet6897](https://github.com/planet6897), [@postmelee](https://github.com/postmelee), [@seanshin](https://github.com/seanshin), [@seo-rii](https://github.com/seo-rii), [@seunghan91](https://github.com/seunghan91), [@yl-star7](https://github.com/yl-star7)
+v0.7.x cycle cumulative external contributors: [@ahnbu](https://github.com/ahnbu), [@bapdodi](https://github.com/bapdodi), [@cskwork](https://github.com/cskwork), Dangel, [@DanMeon](https://github.com/DanMeon), [@dragonnite1221-lgtm](https://github.com/dragonnite1221-lgtm), [@dreamworker0](https://github.com/dreamworker0), [@jangster77](https://github.com/jangster77), [@johndoekim](https://github.com/johndoekim), [@kihyunnn](https://github.com/kihyunnn), [@marsimon](https://github.com/marsimon), [@oksure](https://github.com/oksure), [@planet6897](https://github.com/planet6897), [@postmelee](https://github.com/postmelee), [@seanshin](https://github.com/seanshin), [@seo-rii](https://github.com/seo-rii), [@seunghan91](https://github.com/seunghan91), [@ubermensch1218](https://github.com/ubermensch1218), [@xogh3198](https://github.com/xogh3198), [@yl-star7](https://github.com/yl-star7)
 
 ### v1.0.0 — Typesetting Engine
 
@@ -194,12 +343,13 @@ See the [roadmap document](mydocs/eng/report/rhwp-milestone.md) for details.
 ### Output
 - SVG export (CLI, legacy + layer replay)
 - Canvas rendering (WASM/Web)
+- HWP save path for native HWP editing and HWPX → HWP conversion
 - Debug overlay (paragraph/table boundaries + indices + y-coordinates)
 
 ### Multi-Renderer Backends
 - `PageRenderTree` can be lowered into a `PageLayerTree` paint IR before backend replay.
 - P1 public surfaces are Rust native `DocumentCore::build_page_layer_tree(page)` and WASM `getPageLayerTree(page)`.
-- Layer JSON starts at `schemaVersion: 1`, uses `unit: "px"`, and uses `coordinateSystem: "page-top-left"` to match the existing page render coordinates.
+- Layer JSON starts at `schemaVersion: 1`, uses additive `schemaMinorVersion` / `resourceTableMinorVersion`, `unit: "px"`, and `coordinateSystem: "page-top-left-y-down"` to match the existing page render coordinates.
 - Compatible schema changes should be additive; incompatible JSON shape changes require a schema version bump.
 - **Legacy SVG** remains the default compatibility output.
 - **Layered SVG** can be exercised with `RHWP_RENDER_PATH=layer-svg`.
@@ -212,10 +362,14 @@ See the [roadmap document](mydocs/eng/report/rhwp-milestone.md) for details.
 - P5 adds native Skia equation replay from `EquationNode.layout_box`, so equations are no longer placeholder boxes in the PNG path.
 - P5 replays the existing equation layout tree directly; it does not add CanvasKit equation replay or native form replay.
 - P6 adds native Skia `RawSvg` fragment rasterization through `resvg`, with external file href loading disabled.
+- P21 adds report-first renderer baseline sweep artifacts and shared replay-plane helpers so SVG, Canvas2D, CanvasKit, and native Skia compare the same background/behindText/flow/inFrontText plane ordering before the sweep becomes a default CI gate.
+- P22 keeps public Canvas on the existing layer path but reduces the WebCanvas layer adapter: core `PaintOp` leaves are replayed directly instead of being rebuilt as temporary `RenderNode` wrappers. Layer JSON also separates canonical `buildOptions`, `debugOptions`, and replay `outputOptions` metadata while keeping legacy `outputOptions` mirrors for compatibility.
+- P23 promotes SVG-derived PDF export to native `DocumentCore` APIs for single-page, explicit page selection, and full-document export. The CLI `export-pdf` command now uses the same native API surface, and render-diff CI writes a report-only PDF visual diff by rasterizing `export-pdf` output against browser Canvas output. Direct/vector PDF replay remains a follow-up.
+- P24-P27 harden strict text/glyph sidecar proof boundaries: bitmap/SVG glyph resource identity, variation/TTC/dataRef/digest proof, guarded orientation/transform authority, and font resolver/proof separation. `TextRun` remains the compatibility fallback whenever proof is incomplete.
 - CI covers the native Skia path with `cargo test --features native-skia skia --lib`; the feature is not available on `wasm32` targets.
-- The initial native Skia path is a PNG raster backend with core image/equation/raw-svg replay; CanvasKit, resource interning/cache, complex text shaping, advanced image parity, and native form replay stay as follow-up work.
+- The initial native Skia path is a PNG raster backend with core image/equation/raw-svg replay; full CanvasKit glyph replay, exact native glyph replay, real document font blob extraction, complex text shaping, advanced image parity, and native form replay stay as follow-up work.
 - C ABI export is intentionally left for a later PR.
-- `ResourceArena` is reserved in `PageLayerTree`; binary resource interning is not implemented yet.
+- `ResourceArena` now supports interned image, static SVG, and font blob resources for guarded replay proof; broader document extraction and full resource transport remain follow-up work.
 - This phase establishes the frontend/backend boundary for later CanvasKit and fuller native Skia backends.
 
 ### Web Editor
@@ -231,6 +385,8 @@ See the [roadmap document](mydocs/eng/report/rhwp-milestone.md) for details.
 - Template data binding support
 
 ## npm Packages — Use in Your Web Project
+
+Current release: `@rhwp/core` / `@rhwp/editor` v0.7.18.
 
 ### Embed a Full Editor (3 lines)
 
@@ -282,7 +438,7 @@ document.getElementById('viewer').innerHTML = doc.renderPageSvg(0);
 New contributors: start with the [onboarding guide](mydocs/eng/manual/onboarding_guide.md). It covers project architecture, debugging tools, and the development workflow at a glance.
 
 ### Requirements
-- Rust 1.75+
+- Rust 1.93.1 (pinned by `rust-toolchain.toml`)
 - Docker (for WASM build)
 - Node.js 18+ (for web editor)
 
