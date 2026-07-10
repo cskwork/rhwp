@@ -16,6 +16,9 @@ const DIR_ENTRY_SIZE: usize = 128;
 const ENTRIES_PER_DIR_SECTOR: usize = SECTOR_SIZE / DIR_ENTRY_SIZE; // 4
 const FAT_ENTRIES_PER_SECTOR: usize = SECTOR_SIZE / 4; // 128
 const HEADER_DIFAT_COUNT: usize = 109;
+// DIFAT 섹터는 128 엔트리 중 마지막 1개를 다음 DIFAT 섹터 체인 포인터로 쓰므로
+// FAT 섹터 포인터는 섹터당 127개만 담는다.
+const DIFAT_ENTRIES_PER_SECTOR: usize = FAT_ENTRIES_PER_SECTOR - 1; // 127
 
 const ENDOFCHAIN: u32 = 0xFFFFFFFE;
 const FREESECT: u32 = 0xFFFFFFFF;
@@ -137,36 +140,36 @@ pub fn build_cfb(named_streams: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     }
 
     // FAT/DIFAT 섹터 수 계산 (고정점 반복)
-    // Header DIFAT에는 FAT 섹터 109개까지만 들어간다. 큰 문서는 추가
-    // DIFAT 섹터가 필요하고, 그 DIFAT 섹터도 FAT에 포함되어야 한다.
-    let non_fat_sectors = next_sector;
+    //
+    // CFB v3 헤더는 FAT 섹터 포인터를 최대 109개만 담는다. FAT 섹터가 109개를
+    // 초과하면(출력 > 약 7.14MB = 109 × 128 × 512 byte) 나머지 포인터는
+    // DIFAT(이중 간접 FAT) 섹터에 기록해야 한다. FAT 섹터와 DIFAT 섹터 자체도
+    // 섹터를 차지하여 total_sectors를 늘리고, 이는 다시 fat_count(→difat_count)를
+    // 늘릴 수 있으므로 두 값을 함께 고정점 반복으로 수렴시킨다.
+    let non_meta_sectors = next_sector; // FAT/DIFAT 제외 섹터 수
     let mut fat_count = 1u32;
     let mut difat_count = 0u32;
     loop {
-        let total = non_fat_sectors + fat_count + difat_count;
+        let total = non_meta_sectors + fat_count + difat_count;
         let needed_fat =
-            ((total as usize) + FAT_ENTRIES_PER_SECTOR - 1) / FAT_ENTRIES_PER_SECTOR;
-        let extra_fat = (needed_fat as u32).saturating_sub(HEADER_DIFAT_COUNT as u32);
-        let needed_difat = if extra_fat == 0 {
-            0
+            (((total as usize) + FAT_ENTRIES_PER_SECTOR - 1) / FAT_ENTRIES_PER_SECTOR) as u32;
+        let needed_difat = if needed_fat as usize > HEADER_DIFAT_COUNT {
+            (((needed_fat as usize - HEADER_DIFAT_COUNT) + DIFAT_ENTRIES_PER_SECTOR - 1)
+                / DIFAT_ENTRIES_PER_SECTOR) as u32
         } else {
-            ((extra_fat as usize) + 126) / 127
-        } as u32;
-
-        if needed_fat as u32 == fat_count && needed_difat == difat_count {
+            0
+        };
+        if needed_fat <= fat_count && needed_difat <= difat_count {
             break;
         }
-        fat_count = needed_fat as u32;
-        difat_count = needed_difat;
+        // 섹터 수는 단조 증가만 하므로 max로 수렴을 보장한다.
+        fat_count = needed_fat.max(fat_count);
+        difat_count = needed_difat.max(difat_count);
     }
 
-    let fat_start = non_fat_sectors;
-    let difat_start = if difat_count > 0 {
-        fat_start + fat_count
-    } else {
-        ENDOFCHAIN
-    };
-    let total_sectors = non_fat_sectors + fat_count + difat_count;
+    let fat_start = non_meta_sectors;
+    let difat_start = fat_start + fat_count;
+    let total_sectors = non_meta_sectors + fat_count + difat_count;
 
     // 5. FAT 구축
     let mut fat = vec![FREESECT; total_sectors as usize];
@@ -224,11 +227,10 @@ pub fn build_cfb(named_streams: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
     for i in 0..fat_count as usize {
         fat[fat_start as usize + i] = FATSECT;
     }
+
     // DIFAT 섹터 마커
-    if difat_start != ENDOFCHAIN {
-        for i in 0..difat_count as usize {
-            fat[difat_start as usize + i] = DIFSECT;
-        }
+    for i in 0..difat_count as usize {
+        fat[difat_start as usize + i] = DIFSECT;
     }
 
     // 6. 바이너리 조립
@@ -274,9 +276,8 @@ pub fn build_cfb(named_streams: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         for (i, &mf) in mini_fat.iter().enumerate() {
             let sector_idx = i / FAT_ENTRIES_PER_SECTOR;
             let entry_in_sector = i % FAT_ENTRIES_PER_SECTOR;
-            let offset = 512
-                + (mini_fat_start as usize + sector_idx) * SECTOR_SIZE
-                + entry_in_sector * 4;
+            let offset =
+                512 + (mini_fat_start as usize + sector_idx) * SECTOR_SIZE + entry_in_sector * 4;
             output[offset..offset + 4].copy_from_slice(&mf.to_le_bytes());
         }
     }
@@ -290,29 +291,29 @@ pub fn build_cfb(named_streams: &[(&str, &[u8])]) -> Result<Vec<u8>, String> {
         output[offset..offset + 4].copy_from_slice(&fat_entry.to_le_bytes());
     }
 
-    // DIFAT 작성: 헤더 DIFAT(109개) 이후 FAT 섹터 SID 목록.
-    if difat_start != ENDOFCHAIN {
-        for sector_idx in 0..difat_count as usize {
-            let sector_offset = 512 + (difat_start as usize + sector_idx) * SECTOR_SIZE;
-            for entry_idx in 0..127usize {
-                let fat_idx = HEADER_DIFAT_COUNT + sector_idx * 127 + entry_idx;
-                let sid = if fat_idx < fat_count as usize {
-                    fat_start + fat_idx as u32
-                } else {
-                    FREESECT
-                };
-                let offset = sector_offset + entry_idx * 4;
-                output[offset..offset + 4].copy_from_slice(&sid.to_le_bytes());
-            }
-
-            let next = if sector_idx + 1 < difat_count as usize {
-                difat_start + sector_idx as u32 + 1
+    // DIFAT 섹터 작성
+    // 헤더가 담는 109개를 제외한 나머지 FAT 섹터 포인터를 DIFAT 섹터에 기록한다.
+    // 각 DIFAT 섹터: 엔트리 0..127 = FAT 섹터 SID, 엔트리 127 = 다음 DIFAT 섹터 체인.
+    for d in 0..difat_count as usize {
+        let sector_base = 512 + (difat_start as usize + d) * SECTOR_SIZE;
+        for j in 0..DIFAT_ENTRIES_PER_SECTOR {
+            let fat_idx = HEADER_DIFAT_COUNT + d * DIFAT_ENTRIES_PER_SECTOR + j;
+            let value = if (fat_idx as u32) < fat_count {
+                fat_start + fat_idx as u32
             } else {
-                ENDOFCHAIN
+                FREESECT
             };
-            output[sector_offset + 127 * 4..sector_offset + 128 * 4]
-                .copy_from_slice(&next.to_le_bytes());
+            let off = sector_base + j * 4;
+            output[off..off + 4].copy_from_slice(&value.to_le_bytes());
         }
+        // 마지막 엔트리(127번): 다음 DIFAT 섹터 체인 (마지막 섹터면 ENDOFCHAIN)
+        let next = if d + 1 < difat_count as usize {
+            difat_start + (d as u32) + 1
+        } else {
+            ENDOFCHAIN
+        };
+        let off = sector_base + DIFAT_ENTRIES_PER_SECTOR * 4;
+        output[off..off + 4].copy_from_slice(&next.to_le_bytes());
     }
 
     Ok(output)
@@ -413,7 +414,7 @@ fn write_header(
     mini_fat_start: u32,
     mini_fat_sector_count: u32,
     difat_start: u32,
-    difat_sector_count: u32,
+    difat_count: u32,
 ) {
     // 시그니처
     output[0..8].copy_from_slice(&CFB_SIGNATURE);
@@ -453,15 +454,21 @@ fn write_header(
     // Total mini FAT sectors
     output[64..68].copy_from_slice(&mini_fat_sector_count.to_le_bytes());
 
-    // First DIFAT sector
-    output[68..72].copy_from_slice(&difat_start.to_le_bytes());
+    // First DIFAT sector: DIFAT 섹터가 있으면 그 시작 SID, 없으면 ENDOFCHAIN
+    let first_difat = if difat_count > 0 {
+        difat_start
+    } else {
+        ENDOFCHAIN
+    };
+    output[68..72].copy_from_slice(&first_difat.to_le_bytes());
     // Total DIFAT sectors
-    output[72..76].copy_from_slice(&difat_sector_count.to_le_bytes());
+    output[72..76].copy_from_slice(&difat_count.to_le_bytes());
 
-    // DIFAT 배열 (109개 엔트리, 각 4바이트)
-    let difat_start = 76;
+    // 헤더 내 DIFAT 배열 (선두 109개 FAT 섹터 포인터, 각 4바이트, 바이트 오프셋 76부터)
+    // FAT 섹터가 109개를 초과하는 나머지는 DIFAT 섹터에 기록된다.
+    let header_difat_offset = 76;
     for i in 0..HEADER_DIFAT_COUNT {
-        let offset = difat_start + i * 4;
+        let offset = header_difat_offset + i * 4;
         if (i as u32) < fat_count {
             let sid = fat_start + i as u32;
             output[offset..offset + 4].copy_from_slice(&sid.to_le_bytes());
@@ -597,20 +604,14 @@ mod tests {
         let mut cfb = cfb::CompoundFile::open(cursor).unwrap();
 
         let mut s0 = Vec::new();
-        std::io::Read::read_to_end(
-            &mut cfb.open_stream("/BodyText/Section0").unwrap(),
-            &mut s0,
-        )
-        .unwrap();
+        std::io::Read::read_to_end(&mut cfb.open_stream("/BodyText/Section0").unwrap(), &mut s0)
+            .unwrap();
         assert_eq!(s0.len(), 2000);
         assert!(s0.iter().all(|&b| b == 0x03));
 
         let mut s1 = Vec::new();
-        std::io::Read::read_to_end(
-            &mut cfb.open_stream("/BodyText/Section1").unwrap(),
-            &mut s1,
-        )
-        .unwrap();
+        std::io::Read::read_to_end(&mut cfb.open_stream("/BodyText/Section1").unwrap(), &mut s1)
+            .unwrap();
         assert_eq!(s1.len(), 1500);
         assert!(s1.iter().all(|&b| b == 0x04));
     }
@@ -626,37 +627,8 @@ mod tests {
         let mut cfb = cfb::CompoundFile::open(cursor).unwrap();
 
         let mut read_data = Vec::new();
-        std::io::Read::read_to_end(
-            &mut cfb.open_stream("/BigStream").unwrap(),
-            &mut read_data,
-        )
-        .unwrap();
-        assert_eq!(read_data, data);
-    }
-
-    #[test]
-    fn test_build_cfb_uses_difat_after_header_capacity() {
-        // 109개를 초과하는 FAT 섹터는 헤더 DIFAT만으로 표현할 수 없다.
-        let data = vec![0x7Au8; 8 * 1024 * 1024];
-        let streams = vec![("/BigStream", data.as_slice())];
-        let bytes = build_cfb(&streams).unwrap();
-
-        let fat_count = u32::from_le_bytes(bytes[44..48].try_into().unwrap());
-        let difat_start = u32::from_le_bytes(bytes[68..72].try_into().unwrap());
-        let difat_sector_count = u32::from_le_bytes(bytes[72..76].try_into().unwrap());
-        assert!(fat_count > HEADER_DIFAT_COUNT as u32);
-        assert_ne!(difat_start, ENDOFCHAIN);
-        assert!(difat_sector_count > 0);
-
-        let cursor = std::io::Cursor::new(&bytes);
-        let mut cfb = cfb::CompoundFile::open(cursor).unwrap();
-
-        let mut read_data = Vec::new();
-        std::io::Read::read_to_end(
-            &mut cfb.open_stream("/BigStream").unwrap(),
-            &mut read_data,
-        )
-        .unwrap();
+        std::io::Read::read_to_end(&mut cfb.open_stream("/BigStream").unwrap(), &mut read_data)
+            .unwrap();
         assert_eq!(read_data, data);
     }
 
@@ -665,10 +637,7 @@ mod tests {
         // 미니 스트림(< 4096)과 정규 스트림(>= 4096) 혼합
         let small = vec![0x11u8; 100];
         let large = vec![0x22u8; 5000];
-        let streams = vec![
-            ("/Small", small.as_slice()),
-            ("/Large", large.as_slice()),
-        ];
+        let streams = vec![("/Small", small.as_slice()), ("/Large", large.as_slice())];
         let bytes = build_cfb(&streams).unwrap();
 
         let cursor = std::io::Cursor::new(&bytes);
@@ -681,5 +650,52 @@ mod tests {
         let mut l_read = Vec::new();
         std::io::Read::read_to_end(&mut cfb.open_stream("/Large").unwrap(), &mut l_read).unwrap();
         assert_eq!(l_read, large);
+    }
+
+    #[test]
+    fn test_build_cfb_difat_over_threshold() {
+        // 회귀(#1227): FAT 섹터가 109개를 초과하면(헤더 DIFAT 슬롯 109개 한계 →
+        // 출력 ≈ 109×128×512 = 7,143,424 byte ≈ 7.14MB 초과) DIFAT 섹터가 필요하다.
+        // 과거 mini_cfb는 DIFAT 미작성으로 109개 초과분 FAT 섹터 위치가 유실되어
+        // FAT 체인이 단절, cfb 크레이트가 "next_id invalid"로 열기에 실패했다.
+        //
+        // 임계값 바로 위(약 7.2MB)로 최소화해 CI 메모리/시간 부담을 줄인다. 이보다
+        // 작으면 FAT 섹터가 109개 이하라 DIFAT 경로를 타지 않으므로 더 줄일 수 없다.
+        // 결정적 패턴을 써서 별도 대용량 기대 버퍼 없이 검증하고, 입력은 즉시 해제한다.
+        let n = 7_200_000usize;
+        let big: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let bytes = {
+            let streams = vec![("/BinData/BIN0001", big.as_slice())];
+            build_cfb(&streams).unwrap()
+        };
+        drop(big); // 입력 버퍼 즉시 해제 — 동시 보유 메모리 절감
+
+        // 헤더에 DIFAT 섹터가 기록되었는지 확인
+        let first_difat = u32::from_le_bytes(bytes[68..72].try_into().unwrap());
+        let num_difat = u32::from_le_bytes(bytes[72..76].try_into().unwrap());
+        assert!(num_difat > 0, "출력이 7.14MB를 넘는데 DIFAT 섹터가 0개");
+        assert_ne!(
+            first_difat, ENDOFCHAIN,
+            "DIFAT가 필요한데 first_difat가 ENDOFCHAIN"
+        );
+
+        // cfb 크레이트로 라운드트립 검증 (FAT 체인이 온전해야 열림)
+        let cursor = std::io::Cursor::new(&bytes);
+        let mut cfb = cfb::CompoundFile::open(cursor).unwrap();
+        let mut read_data = Vec::new();
+        std::io::Read::read_to_end(
+            &mut cfb.open_stream("/BinData/BIN0001").unwrap(),
+            &mut read_data,
+        )
+        .unwrap();
+        // 길이 + 결정적 패턴 일치로 검증 (별도 대용량 기대 버퍼 보유 없음)
+        assert_eq!(read_data.len(), n);
+        assert!(
+            read_data
+                .iter()
+                .enumerate()
+                .all(|(i, &b)| b == (i % 251) as u8),
+            "라운드트립 데이터가 원본 패턴과 불일치"
+        );
     }
 }

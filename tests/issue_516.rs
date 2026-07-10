@@ -5,7 +5,8 @@
 //! JSON 에 워터마크 메타정보가 없어 AI 활용 불가.
 //!
 //! 정정:
-//! - ImageAttr 헬퍼 (`is_watermark`, `is_hancom_watermark_preset`, `watermark_preset`)
+//! - ImageAttr 헬퍼 (`is_watermark`, `watermark_preset`) — Issue #1156 에서
+//!   밝기·대비 기반 판정으로 정정 (특정값 매칭 `is_hancom_watermark_preset` 폐기)
 //! - rhwp dump 의 그림 출력에 [image_attr] 줄 추가 (effect/brightness/contrast/watermark)
 //! - PaintOp::Image JSON 에 "watermark":{"preset":"..."} 조건부 추가
 //! - web_canvas.rs 의 image render 시 CSS filter 적용 (Canvas 시각 정정, wasm 빌드 검증)
@@ -15,62 +16,67 @@
 
 use rhwp::model::image::{ImageAttr, ImageEffect};
 
-#[test]
-fn issue_516_image_attr_helper_hancom_preset() {
-    // 한컴 자동 프리셋: effect=GrayScale, brightness=70, contrast=-50
-    let attr = ImageAttr {
-        brightness: 70,
-        contrast: -50,
-        effect: ImageEffect::GrayScale,
-        bin_data_id: 1,
-        external_path: None,
-    };
-    assert!(attr.is_watermark(), "한컴 프리셋은 워터마크");
-    assert!(attr.is_hancom_watermark_preset(), "한컴 자동 프리셋 정합");
-    assert_eq!(attr.watermark_preset(), Some("hancom-watermark"));
-}
+// [Issue #1156] 워터마크 판정 기준 확정:
+// HWP/HWPX 에 워터마크 적용 비트는 존재하지 않는다 (한컴 공식 파일구조 3.0/5.0 +
+// water-mark.hwp/.hwpx 두 그림 비교로 확정). 한컴 편집기는 "워터마크 효과" 해제 시
+// 밝기·대비를 모두 0 으로 되돌리고, 적용 시 0 이 아닌 값을 부여한다 (기본 70/-50,
+// 사용자 변경 가능). 따라서 워터마크 여부는 밝기·대비가 **둘 다 0 이 아닌 경우**로
+// 판정한다 (effect 종류 무관, 한쪽이라도 0 이면 아님).
+// 특정값 매칭(is_hancom_watermark_preset)은 폐기.
 
 #[test]
-fn issue_516_image_attr_helper_custom_watermark() {
-    // 복학원서.hwp 의 엠블렘: effect=GrayScale, brightness=-50, contrast=70
-    // (편집자 의도적 사용자 정의 — 회색조 + 워터마크 후 슬라이더 추가 조정)
-    let attr = ImageAttr {
-        brightness: -50,
-        contrast: 70,
-        effect: ImageEffect::GrayScale,
-        bin_data_id: 2,
-        external_path: None,
-    };
-    assert!(attr.is_watermark(), "사용자 정의도 워터마크");
-    assert!(!attr.is_hancom_watermark_preset(), "한컴 자동 프리셋 미정합");
-    assert_eq!(attr.watermark_preset(), Some("custom"));
+fn issue_516_image_attr_helper_watermark_by_bright_contrast() {
+    // 밝기·대비가 둘 다 0 이 아니면 워터마크 (effect 무관).
+    // 한컴 기본 프리셋 (GrayScale 70/-50), 사용자 정의 (GrayScale -50/70),
+    // RealPic 배경 워터마크 (143E: RealPic 70/-50) 모두 워터마크.
+    for (b, c, e) in [
+        (70i8, -50i8, ImageEffect::GrayScale),
+        (-50, 70, ImageEffect::GrayScale),
+        (70, -50, ImageEffect::RealPic),
+        (30, 20, ImageEffect::RealPic),
+        (-10, 5, ImageEffect::BlackWhite),
+    ] {
+        let attr = ImageAttr {
+            brightness: b,
+            contrast: c,
+            effect: e,
+            transparency: 0,
+            bin_data_id: 1,
+            external_path: None,
+        };
+        assert!(
+            attr.is_watermark(),
+            "밝기={b} 대비={c} effect={e:?} 는 워터마크 (둘 다 ≠0)"
+        );
+        assert_eq!(attr.watermark_preset(), Some("custom"));
+    }
 }
 
 #[test]
 fn issue_516_image_attr_helper_no_watermark() {
-    // RealPic + b=c=0: 워터마크 아님
-    let plain = ImageAttr::default();
-    assert!(!plain.is_watermark());
-    assert_eq!(plain.watermark_preset(), None);
-
-    // GrayScale + b=c=0: 단순 흑백 변환, 워터마크 아님
-    let gray_only = ImageAttr {
-        effect: ImageEffect::GrayScale,
-        ..ImageAttr::default()
-    };
-    assert!(!gray_only.is_watermark(), "effect-only 는 워터마크 아님");
-    assert_eq!(gray_only.watermark_preset(), None);
-
-    // RealPic + b/c 변경: bc-only 는 워터마크 아님 (effect 가 RealPic)
-    let bc_only = ImageAttr {
-        brightness: 30,
-        contrast: 20,
-        effect: ImageEffect::RealPic,
-        bin_data_id: 0,
-        external_path: None,
-    };
-    assert!(!bc_only.is_watermark(), "bc-only 는 워터마크 아님");
-    assert_eq!(bc_only.watermark_preset(), None);
+    // 밝기·대비 중 하나라도 0 이면 워터마크 아님 (effect 무관).
+    // (0,0) 둘 다 0, (30,0) 대비만 0, (0,20) 밝기만 0 모두 워터마크 아님.
+    for (b, c, e) in [
+        (0i8, 0i8, ImageEffect::RealPic),
+        (0, 0, ImageEffect::GrayScale),
+        (0, 0, ImageEffect::BlackWhite),
+        (30, 0, ImageEffect::RealPic),
+        (0, 20, ImageEffect::GrayScale),
+    ] {
+        let attr = ImageAttr {
+            brightness: b,
+            contrast: c,
+            effect: e,
+            transparency: 0,
+            bin_data_id: 0,
+            external_path: None,
+        };
+        assert!(
+            !attr.is_watermark(),
+            "밝기={b} 대비={c} (effect={e:?}) 는 워터마크 아님 (한쪽이 0)"
+        );
+        assert_eq!(attr.watermark_preset(), None);
+    }
 }
 
 #[test]
@@ -82,7 +88,9 @@ fn issue_516_layer_tree_json_includes_watermark_for_emblem() {
     let bytes = std::fs::read(&hwp_path).expect("read 복학원서.hwp");
     let doc = rhwp::wasm_api::HwpDocument::from_bytes(&bytes).expect("parse 복학원서.hwp");
 
-    let json = doc.get_page_layer_tree_native(0).expect("layer tree page 1");
+    let json = doc
+        .get_page_layer_tree_native(0)
+        .expect("layer tree page 1");
 
     // 본 fixture 의 엠블렘은 custom 워터마크
     assert!(
@@ -105,7 +113,9 @@ fn issue_516_layer_tree_json_no_watermark_for_normal_image() {
     let bytes = std::fs::read(&hwp_path).expect("read 복학원서.hwp");
     let doc = rhwp::wasm_api::HwpDocument::from_bytes(&bytes).expect("parse 복학원서.hwp");
 
-    let json = doc.get_page_layer_tree_native(0).expect("layer tree page 1");
+    let json = doc
+        .get_page_layer_tree_native(0)
+        .expect("layer tree page 1");
 
     // watermark 필드 출현 횟수 = 1 (엠블렘만)
     let watermark_count = json.matches("\"watermark\":").count();
@@ -125,7 +135,9 @@ fn issue_516_layer_tree_json_includes_wrap_for_behind_text() {
     let bytes = std::fs::read(&hwp_path).expect("read 복학원서.hwp");
     let doc = rhwp::wasm_api::HwpDocument::from_bytes(&bytes).expect("parse 복학원서.hwp");
 
-    let json = doc.get_page_layer_tree_native(0).expect("layer tree page 1");
+    let json = doc
+        .get_page_layer_tree_native(0)
+        .expect("layer tree page 1");
 
     // 두 그림 모두 BehindText → JSON 에 "wrap":"behindText" 출현
     assert!(
@@ -133,7 +145,6 @@ fn issue_516_layer_tree_json_includes_wrap_for_behind_text() {
         "복학원서.hwp 의 BehindText 그림에 wrap 필드가 직렬화되어야 함"
     );
 }
-
 
 #[test]
 fn issue_516_diag_count_image_ops() {
@@ -146,8 +157,10 @@ fn issue_516_diag_count_image_ops() {
     let wrap_behind = json.matches("\"wrap\":\"behindText\"").count();
     let mime_png = json.matches("\"mime\":\"image/png\"").count();
     let mime_jpg = json.matches("\"mime\":\"image/jpeg\"").count();
-    eprintln!("image ops: {}, wrap=behindText: {}, mime png: {}, mime jpg: {}",
-              image_count, wrap_behind, mime_png, mime_jpg);
+    eprintln!(
+        "image ops: {}, wrap=behindText: {}, mime png: {}, mime jpg: {}",
+        image_count, wrap_behind, mime_png, mime_jpg
+    );
 }
 
 #[test]
@@ -164,7 +177,12 @@ fn issue_516_diag_image_op_locations() {
     while let Some(found) = json[idx..].find("\"type\":\"image\"") {
         let abs = idx + found;
         let start = abs.saturating_sub(80);
-        eprintln!("--- image op #{} at pos {}: ...{}", count, abs, &json[start..abs.min(json.len())]);
+        eprintln!(
+            "--- image op #{} at pos {}: ...{}",
+            count,
+            abs,
+            &json[start..abs.min(json.len())]
+        );
         // 그리고 mime 까지 포함
         let end = (abs + 100).min(json.len());
         eprintln!("    after image: {}", &json[abs..end]);

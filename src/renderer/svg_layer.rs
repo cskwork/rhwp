@@ -95,6 +95,7 @@ impl SvgLayerRenderer {
                             model_cell_index: None,
                         }),
                     },
+                    ClipKind::TextBox => RenderNodeType::TextBox,
                     ClipKind::Generic => RenderNodeType::Body {
                         clip_rect: Some(*clip),
                     },
@@ -110,74 +111,94 @@ impl SvgLayerRenderer {
             }
             LayerNodeKind::Leaf { ops } => ops
                 .iter()
-                .map(|op| self.paint_op_to_render_node(op, node.source_node_id))
+                .filter_map(|op| self.paint_op_to_render_node(op, node.source_node_id))
                 .collect(),
         }
     }
 
-    fn paint_op_to_render_node(&mut self, op: &PaintOp, source_node_id: Option<u32>) -> RenderNode {
-        match op {
+    fn paint_op_to_render_node(
+        &mut self,
+        op: &PaintOp,
+        source_node_id: Option<u32>,
+    ) -> Option<RenderNode> {
+        let node = match op {
             PaintOp::PageBackground { bbox, background } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::PageBackground(background.clone()),
+                RenderNodeType::PageBackground(background.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::TextRun { bbox, run } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::TextRun(run.clone()),
+                RenderNodeType::TextRun(run.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::FootnoteMarker { bbox, marker } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::FootnoteMarker(marker.clone()),
+                RenderNodeType::FootnoteMarker(marker.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::Line { bbox, line } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Line(line.clone()),
+                RenderNodeType::Line(line.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::Rectangle { bbox, rect } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Rectangle(rect.clone()),
+                RenderNodeType::Rectangle(rect.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::Ellipse { bbox, ellipse } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Ellipse(ellipse.clone()),
+                RenderNodeType::Ellipse(ellipse.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::Path { bbox, path } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Path(path.clone()),
+                RenderNodeType::Path(path.as_ref().clone()),
                 *bbox,
             ),
-            PaintOp::Image { bbox, image } => RenderNode::new(
+            PaintOp::Image {
+                bbox,
+                image,
+                resolved,
+            } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Image(image.clone()),
+                RenderNodeType::Image(
+                    crate::renderer::image_resolver::image_node_with_resolved_payload(
+                        image,
+                        resolved.as_deref(),
+                    ),
+                ),
                 *bbox,
             ),
             PaintOp::Equation { bbox, equation } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Equation(equation.clone()),
+                RenderNodeType::Equation(equation.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::FormObject { bbox, form } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::FormObject(form.clone()),
+                RenderNodeType::FormObject(form.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::Placeholder { bbox, placeholder } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::Placeholder(placeholder.clone()),
+                RenderNodeType::Placeholder(placeholder.as_ref().clone()),
                 *bbox,
             ),
             PaintOp::RawSvg { bbox, raw } => RenderNode::new(
                 self.take_node_id(source_node_id),
-                RenderNodeType::RawSvg(raw.clone()),
+                RenderNodeType::RawSvg(raw.as_ref().clone()),
                 *bbox,
             ),
-        }
+            PaintOp::GlyphRun { .. }
+            | PaintOp::GlyphOutline { .. }
+            | PaintOp::CharOverlap { .. }
+            | PaintOp::TextControlMark { .. }
+            | PaintOp::TabLeader { .. }
+            | PaintOp::TextDecoration { .. } => return None,
+        };
+        Some(node)
     }
 
     fn group_kind_to_render_node_type(&self, group_kind: &GroupKind) -> RenderNodeType {
@@ -310,18 +331,18 @@ mod tests {
         });
         render_tree.root.children.push(RenderNode::new(
             21,
-            RenderNodeType::RawSvg(RawSvgNode {
-                svg: "<g><circle cx=\"20\" cy=\"20\" r=\"8\" fill=\"#ff0000\"/></g>\n".to_string(),
-            }),
+            RenderNodeType::RawSvg(RawSvgNode::new(
+                "<g><circle cx=\"20\" cy=\"20\" r=\"8\" fill=\"#ff0000\"/></g>\n".to_string(),
+            )),
             BoundingBox::new(0.0, 0.0, 40.0, 40.0),
         ));
         render_tree.root.children.push(RenderNode::new(
             22,
-            RenderNodeType::Placeholder(PlaceholderNode {
-                fill_color: 0x00F8F8F8,
-                stroke_color: 0x00000000,
-                label: "OLE".to_string(),
-            }),
+            RenderNodeType::Placeholder(PlaceholderNode::new(
+                0x00F8F8F8,
+                0x00000000,
+                "OLE".to_string(),
+            )),
             BoundingBox::new(50.0, 10.0, 80.0, 50.0),
         ));
 

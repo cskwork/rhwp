@@ -150,6 +150,8 @@ pub const CTRL_EQUATION: u32 = ctrl_id(b"eqed");
 pub const CTRL_GEN_SHAPE: u32 = ctrl_id(b"gso ");
 /// 그림 도형 (SHAPE_COMPONENT 내부 ctrl_id)
 pub const SHAPE_PICTURE_ID: u32 = ctrl_id(b"$pic");
+/// OLE 도형 (SHAPE_COMPONENT 내부 ctrl_id)
+pub const SHAPE_OLE_ID: u32 = ctrl_id(b"$ole");
 /// 사각형 (SHAPE_COMPONENT 내부 ctrl_id)
 pub const SHAPE_RECT_ID: u32 = ctrl_id(b"$rec");
 /// 직선 (SHAPE_COMPONENT 내부 ctrl_id)
@@ -164,6 +166,8 @@ pub const SHAPE_ARC_ID: u32 = ctrl_id(b"$arc");
 pub const SHAPE_CURVE_ID: u32 = ctrl_id(b"$cur");
 /// 연결선 (SHAPE_COMPONENT 내부 ctrl_id)
 pub const SHAPE_CONNECTOR_ID: u32 = ctrl_id(b"$col");
+/// 묶음 컨테이너 (SHAPE_COMPONENT 내부 ctrl_id)
+pub const SHAPE_CONTAINER_ID: u32 = ctrl_id(b"$con");
 /// 머리말
 pub const CTRL_HEADER: u32 = ctrl_id(b"head");
 /// 꼬리말
