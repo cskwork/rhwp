@@ -1,0 +1,229 @@
+- main [ref=e2]:
+  - generic [ref=e3]:
+    - generic [ref=e4]:
+      - paragraph [ref=e5]: RHWP EMBED POC
+      - heading "HML 웹 편집 연동 검증" [level=1] [ref=e6]
+      - paragraph [ref=e7]: 스토리지 GET → iframe RPC → 편집 → HML export 가능 여부를 한 화면에서 확인합니다.
+    - status [ref=e8]:
+      - generic [ref=e10]: 호스팅 편집기 연결 완료 · 문서를 선택하세요.
+  - region "HML 연동 작업 영역" [ref=e11]:
+    - complementary [ref=e12]:
+      - generic [ref=e13]:
+        - heading "1. 샘플 열기" [level=2] [ref=e14]
+        - paragraph [ref=e15]: 저장소에 이미 포함된 fixture만 사용합니다.
+        - button "수식 HWP 샘플" [ref=e16] [cursor=pointer]
+        - button "ExamBank 수학 HML" [ref=e17] [cursor=pointer]
+        - paragraph [ref=e18]: ExamBank fixture의 기존 수식 4개가 보이는지 확인합니다.
+      - generic [ref=e19]:
+        - heading "2. 문서 가져오기" [level=2] [ref=e20]
+        - generic [ref=e21] [cursor=pointer]:
+          - text: 로컬 HWP / HWPX / HML
+          - button "로컬 HWP / HWPX / HML" [ref=e22]
+        - generic [ref=e23]: 원격 GET URL
+        - generic [ref=e24]:
+          - textbox "원격 GET URL" [ref=e25]:
+            - /placeholder: https://storage.example/question.hml
+          - button "GET" [ref=e26] [cursor=pointer]
+        - paragraph [ref=e27]: 원격 저장소는 이 페이지 origin을 CORS로 허용해야 합니다.
+      - generic [ref=e28]:
+        - heading "3. 저장 경계 확인" [level=2] [ref=e29]
+        - button "exportHml RPC 호출" [ref=e30] [cursor=pointer]
+        - generic [ref=e31]:
+          - strong [ref=e32]: 현재 공개 호스트 경계
+          - paragraph [ref=e33]:
+            - code [ref=e34]: exportHml
+            - text: 은 공개 RPC에 없습니다. 버튼은 실제 오류를 호출하고 지원 여부를 판정합니다.
+    - region "호스팅 편집기" [ref=e35]:
+      - iframe [ref=e36]:
+        - generic [active] [ref=f1e1]:
+          - generic [ref=f1e2]:
+            - generic [ref=f1e3]:
+              - generic [ref=f1e5] [cursor=pointer]: 파일
+              - generic [ref=f1e7] [cursor=pointer]: 편집
+              - generic [ref=f1e8]:
+                - generic [ref=f1e9] [cursor=pointer]: 보기
+                - text: ¶ ↵
+              - generic [ref=f1e11] [cursor=pointer]: 입력
+              - generic [ref=f1e13] [cursor=pointer]: 서식
+              - generic [ref=f1e15] [cursor=pointer]: 쪽
+              - generic [ref=f1e17] [cursor=pointer]: 표
+              - generic [ref=f1e19] [cursor=pointer]: 도구
+            - generic [ref=f1e20]:
+              - generic [ref=f1e21]:
+                - button "오려 두기" [ref=f1e163] [cursor=pointer]:
+                  - generic [ref=f1e164]:
+                    - text: 오려
+                    - text: 두기
+                - button "복사 하기" [ref=f1e165] [cursor=pointer]:
+                  - generic [ref=f1e166]:
+                    - text: 복사
+                    - text: 하기
+                - button "붙이기" [ref=f1e167] [cursor=pointer]:
+                  - generic [ref=f1e168]: 붙이기
+                - button "모양 복사" [ref=f1e169] [cursor=pointer]:
+                  - generic [ref=f1e170]:
+                    - text: 모양
+                    - text: 복사
+              - generic [ref=f1e31]:
+                - button "¶ 조판 부호" [ref=f1e171] [cursor=pointer]:
+                  - generic [ref=f1e33]: ¶
+                  - generic [ref=f1e172]:
+                    - text: 조판
+                    - text: 부호
+                - button "↵ 문단 부호" [ref=f1e173] [cursor=pointer]:
+                  - generic [ref=f1e35]: ↵
+                  - generic [ref=f1e174]:
+                    - text: 문단
+                    - text: 부호
+                - button "격자 보기" [ref=f1e36] [cursor=pointer]:
+                  - generic [ref=f1e175]:
+                    - text: 격자
+                    - text: 보기
+              - generic [ref=f1e39]:
+                - button "글자 모양" [ref=f1e40] [cursor=pointer]:
+                  - generic [ref=f1e176]:
+                    - text: 글자
+                    - text: 모양
+                - button "문단 모양" [ref=f1e42] [cursor=pointer]:
+                  - generic [ref=f1e177]:
+                    - text: 문단
+                    - text: 모양
+              - generic [ref=f1e45]:
+                - button "1. 문단 번호" [ref=f1e178] [cursor=pointer]:
+                  - generic [ref=f1e47]: "1."
+                  - generic [ref=f1e179]:
+                    - text: 문단
+                    - text: 번호
+                - button "● 글머리 표" [ref=f1e180] [cursor=pointer]:
+                  - generic [ref=f1e49]: ●
+                  - generic [ref=f1e181]:
+                    - text: 글머리
+                    - text: 표
+                - button "⇤ 수준▲" [ref=f1e182] [cursor=pointer]:
+                  - generic [ref=f1e51]: ⇤
+                  - generic [ref=f1e183]: 수준▲
+                - button "⇥ 수준▼" [ref=f1e184] [cursor=pointer]:
+                  - generic [ref=f1e53]: ⇥
+                  - generic [ref=f1e185]: 수준▼
+              - generic [ref=f1e55]:
+                - button "표 ▾" [ref=f1e186] [cursor=pointer]:
+                  - generic [ref=f1e187]: 표 ▾
+                - button "도형 ▾" [ref=f1e188] [cursor=pointer]:
+                  - generic [ref=f1e189]: 도형 ▾
+                - button "그림" [ref=f1e60] [cursor=pointer]:
+                  - generic [ref=f1e190]: 그림
+              - generic [ref=f1e63]:
+                - button "개체 속성" [ref=f1e191] [cursor=pointer]:
+                  - generic [ref=f1e192]:
+                    - text: 개체
+                    - text: 속성
+                - button "문자표" [ref=f1e193] [cursor=pointer]:
+                  - generic [ref=f1e194]: 문자표
+                - button "하이퍼 링크" [ref=f1e195] [cursor=pointer]:
+                  - generic [ref=f1e196]:
+                    - text: 하이퍼
+                    - text: 링크
+              - generic [ref=f1e72]:
+                - button "머리말" [ref=f1e73] [cursor=pointer]:
+                  - generic [ref=f1e197]: 머리말
+                - button "꼬리말" [ref=f1e75] [cursor=pointer]:
+                  - generic [ref=f1e198]: 꼬리말
+                - button "각주" [ref=f1e77] [cursor=pointer]:
+                  - generic [ref=f1e199]: 각주
+                - button "미주" [ref=f1e79] [cursor=pointer]:
+                  - generic [ref=f1e200]: 미주
+                - generic [ref=f1e81]:
+                  - button "찾기" [ref=f1e201] [cursor=pointer]:
+                    - generic [ref=f1e202]: 찾기
+                  - button "▾" [ref=f1e84] [cursor=pointer]:
+                    - generic [ref=f1e85]: ▾
+                - button "⧉ 이력 관리" [ref=f1e203] [cursor=pointer]:
+                  - generic [ref=f1e87]: ⧉
+                  - generic [ref=f1e204]:
+                    - text: 이력
+                    - text: 관리
+                - button "≍ 문서 비교" [ref=f1e205] [cursor=pointer]:
+                  - generic [ref=f1e89]: ≍
+                  - generic [ref=f1e206]:
+                    - text: 문서
+                    - text: 비교
+            - generic:
+              - combobox "스타일"
+              - combobox "글꼴 적용 언어":
+                - option "대표" [selected]
+                - option "한글"
+                - option "영문"
+                - option "한자"
+                - option "일어"
+                - option "외국어"
+                - option "기호"
+                - option "사용자"
+              - combobox "글꼴":
+                - option "◆ 함초롬"
+                - option "◆ 함초롬돋움"
+                - option "◆ 맑은 고딕"
+                - option "◆ 바탕"
+                - option "함초롬바탕" [selected]
+                - option "함초롬돋움"
+                - option "맑은 고딕"
+                - option "나눔고딕"
+                - option "바탕"
+                - option "돋움"
+                - option "궁서"
+              - generic:
+                - textbox "글자 크기 (pt)": "10.0"
+                - generic: pt
+                - generic:
+                  - button "▲"
+                  - button "▼"
+              - button "가":
+                - generic: 가
+              - button "가":
+                - generic: 가
+              - button "간":
+                - generic: 간
+              - button "가 ▾":
+                - generic: 가
+                - generic: ▾
+              - generic:
+                - button "가 ▾":
+                  - generic: 가
+                  - generic: ▾
+              - generic:
+                - button "간 ▾":
+                  - generic: 간
+                  - generic: ▾
+                - textbox: "#000000"
+              - generic:
+                - button "✏ ▾":
+                  - generic: ✏
+                  - generic: ▾
+              - button "왼쪽 정렬"
+              - button "가운데 정렬"
+              - button "오른쪽 정렬"
+              - button "양쪽 정렬"
+              - button "배분 정렬"
+              - button "나눔 정렬"
+              - generic:
+                - combobox "줄 간격":
+                  - option "100 %"
+                  - option "130 %"
+                  - option "160 %" [selected]
+                  - option "180 %"
+                  - option "200 %"
+                  - option "300 %"
+                - generic:
+                  - button "▲"
+                  - button "▼"
+            - generic [ref=f1e145]:
+              - generic [ref=f1e146]: 1 / 1 쪽
+              - generic [ref=f1e148]: "구역: 1 / 1"
+              - generic [ref=f1e150]: 삽입
+              - generic [ref=f1e151]: HWP 파일을 선택해주세요.
+              - generic [ref=f1e152]:
+                - button "폭 맞춤" [ref=f1e153] [cursor=pointer]
+                - button "쪽 맞춤" [ref=f1e155] [cursor=pointer]
+                - generic [ref=f1e158]: 100%
+                - button "축소" [ref=f1e159] [cursor=pointer]
+                - button "확대" [ref=f1e161] [cursor=pointer]
+          - textbox [ref=f1e210]
